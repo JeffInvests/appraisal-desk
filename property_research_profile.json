@@ -1,0 +1,26 @@
+{
+    "subject_property": {
+        "address": "2816 University Dr, Fort Worth, TX 76109",
+        "market_area": "Fort Worth / Tarrant County",
+        "property_type": "Single-Family Residential",
+        "estimated_ GLA_sqft": 2450,
+        "site_size": "0.23 Acres",
+        "measurement_standard": "ANSI Z765 Required",
+        "special_features": [
+            "Detached unpermitted workshop",
+            "Covered patio"
+        ]
+    },
+    "assignment_parameters": {
+        "intended_use": "Estate / date of death / probate",
+        "valuation_type": "Retrospective Date-of-Death",
+        "market_research_scope": "Past 6 to 12 months from effective date",
+        "estimated_baseline_fee": "$600"
+    },
+    "comparable_search_criteria": {
+        "radius_miles": 1.0,
+        "max_age_months": 12,
+        "property_type_filter": "Single-Family Detached",
+        "sqft_variance_pct": 20
+    }
+}

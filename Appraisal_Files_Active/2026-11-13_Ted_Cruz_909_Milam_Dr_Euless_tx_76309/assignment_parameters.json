@@ -1,0 +1,12 @@
+{
+    "client_name": "Ted Cruz",
+    "phone": "817-222-3333",
+    "email": "TedCruzin@gmail.com",
+    "address": "909 Milam Dr Euless tx 76309",
+    "intended_use": "Property tax protest (ARB)",
+    "valuation_type": "Current Value",
+    "quoted_fee": "$500",
+    "measurement_standard": "ANSI Z765 Required",
+    "search_radius_miles": 1.5,
+    "notes": "Older home but been upgraded "
+}

@@ -1,0 +1,8 @@
+BEGIN:VCARD
+VERSION:3.0
+FN:Sarah Jenkins
+TEL;TYPE=CELL:817-555-0198
+EMAIL;TYPE=INTERNET:sjenkins@example.com
+ADR;TYPE=WORK:;;2816 University Dr, Fort Worth, TX 76109;;;;
+NOTE:Assignment: Date of Death / Probate | Fee: $600
+END:VCARD

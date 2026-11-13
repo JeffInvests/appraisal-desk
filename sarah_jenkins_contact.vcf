@@ -1,0 +1,9 @@
+BEGIN:VCARD
+VERSION:3.0
+FN:Sarah Jenkins
+N:Jenkins;Sarah;;;
+TEL;TYPE=CELL:817-555-0198
+EMAIL;TYPE=INTERNET:sjenkins@example.com
+ADR;TYPE=WORK:;;2816 University Dr, Fort Worth, TX 76109;;;;
+NOTE:Client Type: Executor / administrator / trustee | Intended Use: Estate / date of death / probate
+END:VCARD

@@ -1,0 +1,8 @@
+BEGIN:VCARD
+VERSION:3.0
+FN:David Vance
+TEL;TYPE=CELL:817-555-8492
+EMAIL;TYPE=INTERNET:dvance@example.com
+ADR;TYPE=WORK:;;4201 Camp Bowie Blvd, Fort Worth, TX 76107;;;;
+NOTE:Intended Use: Property tax protest (ARB) | Fee: $500
+END:VCARD

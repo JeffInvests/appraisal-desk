@@ -1,0 +1,76 @@
+{
+    "appraiser_credentials": {
+        "name": "Terrence Bilodeau",
+        "designation": "Texas Certified Residential Real Estate Appraiser",
+        "talcb_license_number": "1360232-CR",
+        "broker_license_status": "Active (Maintained separately per 22 TAC \u00a7153.8)"
+    },
+    "subject_property": {
+        "address": "2816 University Dr, Fort Worth, TX 76109",
+        "client_name": "Sarah Jenkins",
+        "phone": "817-555-0198",
+        "intended_use": "Date of Death / Probate",
+        "quoted_fee": "$600",
+        "condition_rating": "C1",
+        "quality_rating": "Q1",
+        "notes": "Retrospective date-of-death valuation. Check for unpermitted workshop."
+    },
+    "public_records_and_sourcing": {
+        "tad_gla": 2350,
+        "ansi_gla": 2450,
+        "lot_size": "0.23 Acres",
+        "tax_year": 2025,
+        "assessed_value": "$485,000",
+        "source": "Tarrant Appraisal District (TAD) Public Records"
+    },
+    "uad_36_compliance": {
+        "time_adjustment_anchor": "Contract Date (UAD 3.6 Mandate)",
+        "comparables": [
+            {
+                "address": "2840 Tanglewood Trail",
+                "sale_price": 750000,
+                "assigned_weight": "Most Weight",
+                "adjustments": {
+                    "time": 0,
+                    "condition": 0,
+                    "gla_site": 0
+                },
+                "calculated_metrics": {
+                    "net_adjustment": 0,
+                    "gross_adjustment": 0,
+                    "indicated_value": 750000
+                }
+            },
+            {
+                "address": "3112 Park Ridge Dr",
+                "sale_price": 720000,
+                "assigned_weight": "Less Weight",
+                "adjustments": {
+                    "time": 0,
+                    "condition": 0,
+                    "gla_site": 0
+                },
+                "calculated_metrics": {
+                    "net_adjustment": 0,
+                    "gross_adjustment": 0,
+                    "indicated_value": 720000
+                }
+            },
+            {
+                "address": "4100 Bella Flora Dr",
+                "sale_price": 810000,
+                "assigned_weight": "No Weight (Set Aside)",
+                "adjustments": {
+                    "time": 0,
+                    "condition": 0,
+                    "gla_site": 0
+                },
+                "calculated_metrics": {
+                    "net_adjustment": 0,
+                    "gross_adjustment": 0,
+                    "indicated_value": 810000
+                }
+            }
+        ]
+    }
+}
