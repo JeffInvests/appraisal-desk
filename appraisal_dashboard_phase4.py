@@ -2,10 +2,10 @@ import streamlit as st
 import json
 import os
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Configure page layout and professional header
-st.set_page_config(page_title="Appraisal Desk Control Deck", layout="wide")
+st.set_page_config(page_title="Appraisal Desk Control Deck | Clearfork Appraisals", page_icon="🏠", layout="wide")
 
 # Custom CSS Injection for Executive Styling & Clean UI Flow
 st.markdown("""
@@ -43,20 +43,22 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+# ----------------------------------------------------
+# SIDEBAR: DESK PROFILE
+# ----------------------------------------------------
+st.sidebar.header("Desk Profile")
+st.sidebar.text("Appraiser: Terrence Bilodeau")
+st.sidebar.text("License: TX 1360232-CR")
+st.sidebar.text("Coverage: Tarrant & Surrounding")
+st.sidebar.markdown("---")
+st.sidebar.caption("Written fee quote and firm delivery date are issued before every assignment is accepted.")
+
 st.title("⚖️ Appraisal Desk Control Deck")
 st.markdown("### *Clearfork Appraisals · Dual-License (Appraiser/Broker) Workflow Engine*")
-st.markdown("---")
 
-# Navigation Tabs representing the professional appraisal workflow pipeline
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📍 1. Property Intake", 
-    "🏛️ 2. TAD & MLS Audit",
-    "📁 3. Comp Importer", 
-    "💵 4. Fee Schedule",
-    "📋 5. Adjustment & Export Grid"
-])
-
-# Initialize session state for active lead data if not present
+# ----------------------------------------------------
+# SESSION STATE INITIALIZATION
+# ----------------------------------------------------
 if "active_lead" not in st.session_state:
     st.session_state.active_lead = {
         "name": "Sarah Jenkins",
@@ -98,10 +100,82 @@ if "fee_schedule" not in st.session_state:
         "Pre-Purchase for Buyers": 500
     }
 
+PIPELINE_COLUMNS = [
+    "Client Name", "Phone", "Email", "Property Address", "Assignment Type",
+    "Status", "Target Deadline", "Quoted Fee ($)", "Notes"
+]
+PIPELINE_STATUSES = ["Requested", "Fee Quoted", "Active / In Progress", "Completed"]
+
+if "pipeline_data" not in st.session_state:
+    st.session_state.pipeline_data = pd.DataFrame([
+        {
+            "Client Name": "Sarah Jenkins",
+            "Phone": "817-555-0198",
+            "Email": "sjenkins@example.com",
+            "Property Address": "1204 West Magnolia Ave, Fort Worth, TX",
+            "Assignment Type": "Property Tax Protest (ARB)",
+            "Status": "Fee Quoted",
+            "Target Deadline": (datetime.now() + timedelta(days=5)).strftime("%Y-%m-%d"),
+            "Quoted Fee ($)": st.session_state.fee_schedule["Property Tax Protest (ARB)"],
+            "Notes": "Client requested notarized market value as of Jan 1."
+        },
+        {
+            "Client Name": "Michael Chang",
+            "Phone": "817-555-0142",
+            "Email": "mchang@example.com",
+            "Property Address": "4520 Bellaire Dr S, Fort Worth, TX",
+            "Assignment Type": "Date of Death / Probate",
+            "Status": "Active / In Progress",
+            "Target Deadline": (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d"),
+            "Quoted Fee ($)": st.session_state.fee_schedule["Date of Death / Probate"],
+            "Notes": "Retrospective valuation for probate inventory."
+        }
+    ], columns=PIPELINE_COLUMNS)
+
+
+def load_lead_into_workspace(name, phone, email, address, purpose, notes):
+    """Push a lead into the active workspace AND the keyed Step 5 widgets,
+    so the review form actually refreshes (keyed widgets ignore `value=` after first render)."""
+    st.session_state.active_lead = {
+        "name": name, "phone": phone, "email": email,
+        "address": address, "purpose": purpose, "notes": notes
+    }
+    st.session_state["rev_name"] = name
+    st.session_state["rev_phone"] = phone
+    st.session_state["rev_email"] = email
+    st.session_state["rev_addr"] = address
+    st.session_state["rev_notes"] = notes
+    if purpose in st.session_state.fee_schedule:
+        st.session_state["active_intended_use"] = purpose
+
+
+# ----------------------------------------------------
+# OPERATIONAL SNAPSHOT (always visible above the tabs)
+# ----------------------------------------------------
+_pipe = st.session_state.pipeline_data
+_open = _pipe[_pipe["Status"] != "Completed"]
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Open Pipeline Orders", len(_open))
+m2.metric("Open Quoted Value", f"${int(_open['Quoted Fee ($)'].sum()):,}")
+m3.metric("Avg. Response Target", "< 1 Hour")
+m4.metric("License Status", "Active CR")
+st.markdown("---")
+
+# Navigation Tabs representing the professional appraisal workflow pipeline
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "📍 1. Property Intake",
+    "🏛️ 2. TAD & MLS Audit",
+    "📁 3. Comp Importer",
+    "💵 4. Fee Schedule",
+    "📋 5. Adjustment & Export Grid",
+    "🗂️ 6. Pipeline & Quote Tracker",
+    "📚 7. Service Catalog"
+])
+
 with tab1:
     st.subheader("🏡 Step 1: Verified Fort Worth Property Database")
     st.markdown("Select from verified Fort Worth residential properties across established neighborhoods to initiate an assignment.")
-    
+
     ftw_properties = [
         {
             "address": "2816 University Dr, Fort Worth, TX 76109",
@@ -128,15 +202,15 @@ with tab1:
             "notes": "Historic overlay guidelines apply; ANSI Z765 measurement critical."
         }
     ]
-    
+
     with st.container(border=True):
         selected_prop = st.selectbox(
-            "Choose Target Property", 
-            ftw_properties, 
+            "Choose Target Property",
+            ftw_properties,
             format_func=lambda x: f"{x['address']} ({x['neighborhood']})",
             key="target_prop_select"
         )
-        
+
         col_x, col_y = st.columns(2)
         with col_x:
             mock_client_name = st.text_input("Simulated Client Name", value="Arthur Pendelton")
@@ -144,21 +218,17 @@ with tab1:
         with col_y:
             mock_client_email = st.text_input("Simulated Email", value="apendelton@example.com")
             assigned_purpose = st.selectbox(
-                "Intended Use / Service Type", 
-                list(st.session_state.fee_schedule.keys()), 
-                index=0, 
+                "Intended Use / Service Type",
+                list(st.session_state.fee_schedule.keys()),
+                index=0,
                 key="prop_intended_use"
             )
 
         if st.button("🚀 Load Property & Specs into Active Workspace"):
-            st.session_state.active_lead = {
-                "name": mock_client_name,
-                "phone": mock_client_phone,
-                "email": mock_client_email,
-                "address": selected_prop["address"],
-                "purpose": assigned_purpose,
-                "notes": selected_prop["notes"]
-            }
+            load_lead_into_workspace(
+                mock_client_name, mock_client_phone, mock_client_email,
+                selected_prop["address"], assigned_purpose, selected_prop["notes"]
+            )
             st.session_state.tad_records = {
                 "tad_gla": selected_prop["tad_gla"],
                 "ansi_gla": selected_prop["ansi_gla"],
@@ -172,7 +242,7 @@ with tab1:
 with tab2:
     st.subheader("🏛️ Step 2: TAD Public Records & MLS Source Audit")
     st.markdown("Verify official Tarrant Appraisal District (TAD) measurements against actual ANSI Z765 dimensions and broker data feeds.")
-    
+
     col_t1, col_t2 = st.columns(2)
     with col_t1:
         with st.container(border=True):
@@ -180,7 +250,7 @@ with tab2:
             tad_gla_input = st.number_input("TAD Assessed GLA (SqFt)", value=st.session_state.tad_records["tad_gla"])
             ansi_gla_input = st.number_input("Actual ANSI Z765 Measured GLA (SqFt)", value=st.session_state.tad_records["ansi_gla"])
             lot_size_input = st.text_input("Site / Lot Size", value=st.session_state.tad_records["lot_size"])
-            
+
             diff = ansi_gla_input - tad_gla_input
             if diff != 0:
                 st.warning(f"⚠️ **ANSI vs. County Discrepancy:** Measured GLA differs from TAD records by **{diff:+d} SqFt**.")
@@ -191,7 +261,7 @@ with tab2:
         with st.container(border=True):
             st.markdown("### 🌐 Market Comps Log")
             zillow_comp_notes = st.text_area(
-                "Verified Sales Data Log", 
+                "Verified Sales Data Log",
                 value="Comp 1: 2840 Tanglewood Trail | Sold $750,000 | Confirmed via NTREIS MLS on 09/14/2026\nComp 2: 3112 Park Ridge Dr | Sold $720,000 | Confirmed via NTREIS MLS on 08/02/2026",
                 height=170
             )
@@ -210,10 +280,10 @@ with tab2:
 with tab3:
     st.subheader("📁 Step 3: Import Real MLS / NTREIS Comparable Sheets")
     st.markdown("Upload standard CSV exports from your direct broker MLS feed to populate comparative market data.")
-    
+
     with st.container(border=True):
         uploaded_file = st.file_uploader("Upload MLS Comparable Sheet (.csv)", type=["csv"])
-        
+
         if uploaded_file is not None:
             df_comps = pd.read_csv(uploaded_file)
             st.success(f"Successfully loaded {len(df_comps)} comparable records from MLS CSV!")
@@ -230,22 +300,22 @@ with tab3:
 with tab4:
     st.subheader("💵 Step 4: Complete Service Fee Schedule")
     st.markdown("Customize baseline fees across all Clearfork Appraisals service types to drive automated pricing rules.")
-    
+
     fees = st.session_state.fee_schedule
     new_fees = {}
-    
+
     with st.container(border=True):
         col_f1, col_f2 = st.columns(2)
         items = list(fees.items())
         half = len(items) // 2
-        
+
         with col_f1:
             for service_name, current_price in items[:half]:
                 new_fees[service_name] = st.number_input(f"{service_name} ($)", value=int(current_price), step=25, key=f"fee_{service_name}")
         with col_f2:
             for service_name, current_price in items[half:]:
                 new_fees[service_name] = st.number_input(f"{service_name} ($)", value=int(current_price), step=25, key=f"fee_{service_name}")
-            
+
     if st.button("💾 Save Complete Fee Schedule"):
         st.session_state.fee_schedule = new_fees
         st.success("Full service fee schedule successfully updated!")
@@ -267,7 +337,7 @@ with tab5:
         client_email = st.text_input("Email", value=current_lead["email"], key="rev_email")
         property_address = st.text_input("Property Address", value=current_lead["address"], key="rev_addr")
         intended_use = st.selectbox("Intended Use", list(fee_sched.keys()), index=list(fee_sched.keys()).index(current_lead["purpose"]) if current_lead["purpose"] in fee_sched else 0, key="active_intended_use")
-        
+
         with st.container(border=True):
             st.error("✏️ **MANUAL ENTRY REQUIRED:** Property Notes & Unique Traits")
             notes = st.text_area("Property Notes", value=current_lead["notes"], key="rev_notes", help="Enter specific physical defects, unpermitted additions, or custom features here.")
@@ -276,26 +346,26 @@ with tab5:
         baseline_fee = f"${fee_sched.get(intended_use, 500)}"
         st.info(f"**Selected Assignment Type:** {intended_use}")
         st.success(f"**Quoted Baseline Fee:** {baseline_fee} [Fees & Turnaround](https://www.clearforkappraisals.com/#quote)")
-        
+
         st.markdown("### UAD 3.6 Compliance & Standards")
-        
+
         with st.container(border=True):
             st.error("✏️ **PROFESSIONAL RATING REQUIRED (C1–C6 / Q1–Q6):**")
             condition_rating = st.selectbox("Condition Rating", ["C1", "C2", "C3 - Well Maintained", "C4 - Minor Wear", "C5", "C6"], key="cond_rating")
             quality_rating = st.selectbox("Quality Rating", ["Q1", "Q2", "Q3 - Custom/Better", "Q4 - Standard", "Q5", "Q6"], key="qual_rating")
-        
+
         time_adjustment_basis = st.selectbox("Time Adjustment Basis", ["Contract Date (UAD 3.6 Mandate)", "Legacy Closing Date"], key="time_adj")
         st.caption("🛡️ **Compliance Note:** Brokerage market data is kept separate from appraisal valuation opinions under strict [USPAP](https://www.talcb.texas.gov/) independence standards.")
 
     st.markdown("---")
-    
+
     with st.container(border=True):
         st.error("✏️ **APPRAISER RECONCILIATION & ADJUSTMENT ENGINE (UAD 3.6):**")
         st.markdown("Enter dollar adjustments for each comparable sale below. The engine automatically calculates **Net Adjustments**, **Gross Adjustments**, and checks compliance against UAD tolerance thresholds.")
-        
+
         comp_list = st.session_state.get("parsed_comps", [])
         comps_payload = []
-        
+
         for i, comp in enumerate(comp_list[:3]):
             st.markdown(f"#### Comparable #{i+1}")
             c_addr, c_price, c_weight = st.columns([2, 1, 1])
@@ -305,7 +375,7 @@ with tab5:
                 sale_price = st.number_input(f"Sale Price ($)", value=int(comp.get("Sale Price", 750000)), step=5000, key=f"comp_price_{i}")
             with c_weight:
                 weight = st.selectbox(f"UAD 3.6 Weight", ["Most Weight", "Less Weight", "No Weight (Set Aside)"], index=0 if i==0 else (1 if i==1 else 2), key=f"comp_wt_{i}")
-            
+
             adj_col1, adj_col2, adj_col3 = st.columns(3)
             with adj_col1:
                 time_adj = st.number_input(f"Time Adj ($)", value=0, step=1000, key=f"time_adj_{i}")
@@ -313,14 +383,14 @@ with tab5:
                 cond_adj = st.number_input(f"Condition/Quality Adj ($)", value=0, step=1000, key=f"cond_adj_{i}")
             with adj_col3:
                 gla_adj = st.number_input(f"GLA / Site Adj ($)", value=0, step=1000, key=f"gla_adj_{i}")
-            
+
             total_net_adj = time_adj + cond_adj + gla_adj
             total_gross_adj = abs(time_adj) + abs(cond_adj) + abs(gla_adj)
-            
+
             net_pct = (total_net_adj / sale_price) * 100 if sale_price > 0 else 0
             gross_pct = (total_gross_adj / sale_price) * 100 if sale_price > 0 else 0
             indicated_value = sale_price + total_net_adj
-            
+
             res_col1, res_col2, res_col3 = st.columns(3)
             with res_col1:
                 st.metric("Indicated Value", f"${indicated_value:,.0f}")
@@ -328,14 +398,14 @@ with tab5:
                 st.metric("Net Adjustment", f"${total_net_adj:+,.0f} ({net_pct:.1f}%)")
             with res_col3:
                 st.metric("Gross Adjustment", f"${total_gross_adj:,.0f} ({gross_pct:.1f}%)")
-            
+
             if gross_pct > 25.0:
                 st.warning(f"⚠️ **UAD Guideline Alert:** Comp #{i+1} gross adjustments ({gross_pct:.1f}%) exceed standard 25% guideline. Verify comp selection or document explanation.")
             if abs(net_pct) > 15.0:
                 st.warning(f"⚠️ **UAD Guideline Alert:** Comp #{i+1} net adjustments ({net_pct:.1f}%) exceed standard 15% guideline.")
-            
+
             st.markdown("---")
-            
+
             comps_payload.append({
                 "address": addr,
                 "sale_price": sale_price,
@@ -475,8 +545,134 @@ All assignments are performed with impartiality, objectivity, and independence i
             label="📇 Download Contact vCard (.vcf)",
             data=vcard_data,
             file_name=f"{safe_filename_name}_contact.vcf",
-            mime="text/text"
+            mime="text/vcard"
         )
 
+# ----------------------------------------------------
+# TAB 6: PIPELINE & QUOTE TRACKER
+# ----------------------------------------------------
+with tab6:
+    st.subheader("🗂️ Inbound Requests & Pipeline Tracker")
+    st.markdown("Track incoming fee quote requests, monitor turnaround deadlines, and move any file straight into the Step 5 review workspace.")
+
+    view_filter = st.radio(
+        "Show", ["Open files", "All files", "Completed only"],
+        horizontal=True, key="pipeline_view"
+    )
+
+    pipe_df = st.session_state.pipeline_data
+    if view_filter == "Open files":
+        mask = pipe_df["Status"] != "Completed"
+    elif view_filter == "Completed only":
+        mask = pipe_df["Status"] == "Completed"
+    else:
+        mask = pd.Series(True, index=pipe_df.index)
+
+    st.caption("Edit Status, Deadline, Fee or Notes directly in the table; changes save automatically.")
+    edited_view = st.data_editor(
+        pipe_df[mask],
+        use_container_width=True,
+        hide_index=False,
+        disabled=["Client Name", "Phone", "Email", "Property Address", "Assignment Type"],
+        column_config={
+            "Status": st.column_config.SelectboxColumn("Status", options=PIPELINE_STATUSES, required=True),
+            "Quoted Fee ($)": st.column_config.NumberColumn("Quoted Fee ($)", min_value=0, step=25, format="$%d"),
+        },
+        key="pipeline_editor"
+    )
+    # Write edits back to the full dataframe by index
+    st.session_state.pipeline_data.loc[edited_view.index, edited_view.columns] = edited_view
+
+    # Load a pipeline file into the Step 5 workspace
+    st.markdown("### Send a File to the Active Workspace")
+    if len(st.session_state.pipeline_data) > 0:
+        load_idx = st.selectbox(
+            "Pipeline file",
+            st.session_state.pipeline_data.index,
+            format_func=lambda i: f"{st.session_state.pipeline_data.loc[i, 'Client Name']} · {st.session_state.pipeline_data.loc[i, 'Property Address']}",
+            key="pipeline_load_select"
+        )
+        if st.button("📋 Load Selected File into Step 5 Review"):
+            row = st.session_state.pipeline_data.loc[load_idx]
+            load_lead_into_workspace(
+                row["Client Name"], row["Phone"], row["Email"],
+                row["Property Address"], row["Assignment Type"], row["Notes"]
+            )
+            st.success(f"Loaded **{row['Client Name']}** into the active workspace. Open tab 5 to continue.")
+    else:
+        st.info("Pipeline is empty.")
+
+    st.markdown("---")
+    st.markdown("### Log New Inbound Request / Quote")
+
+    with st.form("new_request_form", clear_on_submit=True):
+        f_col1, f_col2 = st.columns(2)
+        with f_col1:
+            new_client = st.text_input("Client Name")
+            new_phone = st.text_input("Phone")
+            new_email = st.text_input("Email")
+            new_address = st.text_input("Property Address (Street, City, ZIP)")
+            new_type = st.selectbox("Assignment Type", list(st.session_state.fee_schedule.keys()))
+        with f_col2:
+            new_status = st.selectbox("Pipeline Status", PIPELINE_STATUSES)
+            new_deadline = st.date_input("Target Delivery Deadline", datetime.now() + timedelta(days=5))
+            fee_override = st.number_input(
+                "Fee override ($) — leave at 0 to use the Fee Schedule (tab 4)",
+                min_value=0, value=0, step=25
+            )
+        new_notes = st.text_area("Notes (deadlines, referral source, client context)")
+
+        submitted = st.form_submit_button("Add to Pipeline")
+
+    if submitted:
+        if new_client and new_address:
+            fee_value = fee_override if fee_override > 0 else st.session_state.fee_schedule.get(new_type, 500)
+            new_row = {
+                "Client Name": new_client,
+                "Phone": new_phone,
+                "Email": new_email,
+                "Property Address": new_address,
+                "Assignment Type": new_type,
+                "Status": new_status,
+                "Target Deadline": new_deadline.strftime("%Y-%m-%d"),
+                "Quoted Fee ($)": int(fee_value),
+                "Notes": new_notes
+            }
+            st.session_state.pipeline_data = pd.concat(
+                [st.session_state.pipeline_data, pd.DataFrame([new_row])],
+                ignore_index=True
+            )
+            st.rerun()
+        else:
+            st.error("Please fill out at least the Client Name and Property Address.")
+
+    st.download_button(
+        "📊 Export Pipeline (.csv)",
+        data=st.session_state.pipeline_data.to_csv(index=False),
+        file_name=f"pipeline_{datetime.now().strftime('%Y-%m-%d')}.csv",
+        mime="text/csv"
+    )
+
+# ----------------------------------------------------
+# TAB 7: SERVICE CATALOG
+# ----------------------------------------------------
+with tab7:
+    st.subheader("📚 Clearfork Appraisals Service Catalog Reference")
+    st.markdown("Quick reference matching the public service definitions. Fees shown come from your live Fee Schedule (tab 4).")
+
+    services = {
+        "Property Tax Protest (ARB)": "Notarized, independent opinion of market value as of January 1, built to meet Tax Code conditions.",
+        "Date of Death / Probate": "Retrospective appraisal establishing what a Tarrant County home was worth on the date of passing for probate.",
+        "Divorce or Marital Property Division": "Objective market valuation of marital real estate and defense of methodology.",
+        "Pre-Listing Appraisal": "Independent opinion of market value plus an ANSI Z765-2021 floor plan.",
+        "Bail Bond & Surety Collateral": "Rapid-turnaround valuation of property pledged to secure a bond or court requirement."
+    }
+
+    for svc, desc in services.items():
+        fee = st.session_state.fee_schedule.get(svc)
+        label = f"{svc} — ${fee}" if fee is not None else svc
+        with st.expander(label):
+            st.write(desc)
+
 st.markdown("---")
-st.markdown("*Appraisal Desk v1.0 · Dual-License Compliant Workflow Engine*")
+st.markdown("*Appraisal Desk v1.1 · Dual-License Compliant Workflow Engine*")
