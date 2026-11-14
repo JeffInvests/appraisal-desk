@@ -6,6 +6,7 @@ Run:   streamlit run appraisal_desk.py
 Needs: streamlit >= 1.35, pandas
 Data:  appraisal_desk.db (SQLite, created next to this file; set APPRAISAL_DB to relocate)
 """
+import hmac
 import io
 import json
 import os
@@ -20,7 +21,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "v2.1"
+APP_VERSION = "v2.2"
 DB_PATH = os.environ.get("APPRAISAL_DB", "appraisal_desk.db")
 BACKUP_ROOT = "Appraisal_Files_Active"
 
@@ -28,6 +29,8 @@ APPRAISER = {
     "name": "Terrence Bilodeau",
     "designation": "Texas Certified Residential Real Estate Appraiser",
     "license": "1360232-CR",
+    "broker_designation": "Texas Real Estate Broker",
+    "broker_license": "0686157",          # as supplied by the user -- verify against TREC
 }
 
 STATUSES = ["Inquiry", "Fee Quoted", "Engaged", "In Progress", "Delivered", "Closed", "Lost"]
@@ -127,6 +130,8 @@ LEAD_COLS = {
     "effective_date": "TEXT", "inspection_type": "TEXT", "inspection_date": "TEXT", "gse_required": "INTEGER",
     "time_rate": "REAL", "time_support": "TEXT", "gla_rate": "REAL", "opinion_value": "INTEGER",
     "unused_json": "TEXT",
+    "paid_date": "TEXT", "paid_amount": "INTEGER",
+    "no_interest": "INTEGER", "no_prior_services": "INTEGER", "disclosure_notes": "TEXT",
 }
 
 
@@ -999,6 +1004,10 @@ def uad_readiness(lead):
         "Subject & Scope tab.")
     add("Assignment", "Inspection type (as specified in the engagement)", bool(lead.get("inspection_type")),
         "Subject & Scope tab.")
+    disc_ok = (bool(lead.get("no_interest")) and bool(lead.get("no_prior_services"))) or \
+        bool((lead.get("disclosure_notes") or "").strip())
+    add("Assignment", "Interest and prior-services (3-year) disclosure addressed", disc_ok,
+        "Subject & Scope tab. Prior services in any capacity includes brokerage work.")
 
     ansi = int(lead.get("ansi_gla") or 0)
     tad = int(lead.get("tad_gla") or 0)
@@ -1110,12 +1119,17 @@ def build_json(lead, calc, unused, items):
         "format_note": ("Working data sheet for keying into appraisal software. This is NOT a UCDP / MISMO XML "
                         "submission and does not include every UAD 3.6 field."),
         "appraiser": {"name": APPRAISER["name"], "designation": APPRAISER["designation"],
-                      "talcb_license_number": APPRAISER["license"]},
+                      "talcb_license_number": APPRAISER["license"],
+                      "broker_designation": APPRAISER["broker_designation"],
+                      "broker_license_number": APPRAISER["broker_license"]},
         "assignment": {
             "client_name": lead.get("client_name"), "intended_use": lead.get("assignment_type"),
             "quoted_fee": lead.get("fee"), "delivery_deadline": lead.get("deadline"),
             "effective_date": lead.get("effective_date"), "inspection_type": lead.get("inspection_type"),
             "inspection_date": lead.get("inspection_date"), "gse_delivered": bool(lead.get("gse_required")),
+            "no_present_or_prospective_interest": bool(lead.get("no_interest")),
+            "no_services_prior_3_years": bool(lead.get("no_prior_services")),
+            "disclosure_notes": lead.get("disclosure_notes"),
         },
         "subject": {
             "address": full_address(lead), "county": lead.get("county"),
@@ -1141,7 +1155,7 @@ def build_json(lead, calc, unused, items):
 def build_markdown(lead, calc, unused, items):
     md = f"""# Appraisal Assignment Audit Summary
 **Clearfork Appraisals**
-*{APPRAISER['name']}, {APPRAISER['designation']} (TALCB #{APPRAISER['license']})*
+*{APPRAISER['name']}, {APPRAISER['designation']} (TALCB #{APPRAISER['license']}) · {APPRAISER['broker_designation']} (#{APPRAISER['broker_license']})*
 *Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*
 
 ---
@@ -1200,13 +1214,298 @@ def build_markdown(lead, calc, unused, items):
 
 
 # ======================================================================
+# REPORTING (business performance, receivables, compliance records)
+# ======================================================================
+WON = ["Engaged", "In Progress", "Delivered", "Closed"]
+EARNED = ["Delivered", "Closed"]
+LITIGATION_SERVICES = {"Expert Witness & Litigation Support", "Divorce or Marital Property Division",
+                       "Partial Interest / Partition Suit", "Bankruptcy Schedule A/B"}
+PERIODS = ["This month", "Last month", "This quarter", "Year to date", "Last 12 months", "All time", "Custom"]
+STATUS_RE = re.compile(r"^Status: (.+) → (.+)$")
+RF_COLS = ["id", "client", "phone", "street", "city", "county", "service", "status", "source", "fee", "created",
+           "updated", "quote", "engaged", "delivered", "deadline", "paid", "paid_amount", "won", "lost", "earned",
+           "no_interest", "no_prior", "disc_note"]
+
+
+def status_history():
+    """{lead_id: {status: timestamp it was first entered}} from the activity log."""
+    out = {}
+    with db() as c:
+        for r in c.execute("SELECT lead_id, ts, message FROM activity ORDER BY id"):
+            m = STATUS_RE.match(r["message"] or "")
+            if m:
+                out.setdefault(r["lead_id"], {}).setdefault(m.group(2), r["ts"])
+    return out
+
+
+def add_years(d, n):
+    try:
+        return d.replace(year=d.year + n)
+    except ValueError:                      # Feb 29
+        return d.replace(year=d.year + n, day=28)
+
+
+def period_bounds(choice, today, custom=None):
+    if choice == "This month":
+        return today.replace(day=1), today
+    if choice == "Last month":
+        end = today.replace(day=1) - timedelta(days=1)
+        return end.replace(day=1), end
+    if choice == "This quarter":
+        return today.replace(month=3 * ((today.month - 1) // 3) + 1, day=1), today
+    if choice == "Year to date":
+        return today.replace(month=1, day=1), today
+    if choice == "Last 12 months":
+        return today - timedelta(days=364), today
+    if choice == "Custom" and custom:
+        s, e = custom
+        return (s, e) if s <= e else (e, s)
+    return date(1900, 1, 1), today          # All time
+
+
+def report_frame(df):
+    """One row per file with the dates the reports need.
+    Dates come from the activity log where the status change was recorded there; otherwise from
+    created / closed / updated timestamps (approximate)."""
+    hist = status_history()
+    rows = []
+    for rec in df.to_dict("records"):
+        rec = {k: (None if _isblank(v) else v) for k, v in rec.items()}
+        h = hist.get(rec["id"], {})
+        status = rec.get("status") or "Inquiry"
+        created = parse_iso(rec.get("created_at"))
+
+        def first(*names):
+            ts = [h[n] for n in names if n in h]
+            return parse_iso(min(ts)) if ts else None
+
+        delivered = None
+        if status in EARNED:
+            delivered = (first("Delivered", "Closed") or parse_iso(rec.get("closed_at"))
+                         or parse_iso(rec.get("updated_at")) or created)
+        fee = int(rec.get("fee") or 0)
+        rows.append({
+            "id": rec["id"], "client": rec.get("client_name") or "", "phone": rec.get("phone") or "",
+            "street": rec.get("street") or "", "city": rec.get("city") or "", "county": rec.get("county") or "",
+            "service": rec.get("assignment_type") or "", "status": status, "source": rec.get("source") or "",
+            "fee": fee, "created": created, "updated": parse_iso(rec.get("updated_at")),
+            "quote": first("Fee Quoted"),
+            "engaged": first("Engaged", "In Progress") or (created if status in WON else None),
+            "delivered": delivered, "deadline": parse_iso(rec.get("deadline")),
+            "paid": parse_iso(rec.get("paid_date")),
+            "paid_amount": int(rec.get("paid_amount") or 0) or fee,
+            "won": status in WON, "lost": status == "Lost", "earned": status in EARNED,
+            "no_interest": bool(rec.get("no_interest")), "no_prior": bool(rec.get("no_prior_services")),
+            "disc_note": (rec.get("disclosure_notes") or "").strip(),
+        })
+    return pd.DataFrame(rows, columns=RF_COLS)
+
+
+def _in(d, s, e):
+    return d is not None and s <= d <= e
+
+
+def _mask(series, s, e):
+    """Boolean mask for dates inside [s, e] -- always dtype bool, even for an empty frame."""
+    return pd.Series([_in(d, s, e) for d in series], index=series.index, dtype=bool)
+
+
+def business_kpis(rf, s, e):
+    deliv = rf[_mask(rf["delivered"], s, e)]
+    new = rf[_mask(rf["created"], s, e)]
+    coll = rf[_mask(rf["paid"], s, e)]
+    won, lost = int(new["won"].sum()), int(new["lost"].sum())
+    turn = [(r.delivered - r.engaged).days for r in deliv.itertuples() if r.engaged and r.delivered]
+    due = [r for r in deliv.itertuples() if r.deadline]
+    qd = [(r.quote - r.created).days for r in new.itertuples() if r.quote and r.created]
+    return {
+        "earned": int(deliv["fee"].sum()), "delivered_n": len(deliv),
+        "avg_fee": float(deliv["fee"].mean()) if len(deliv) else 0.0,
+        "collected": int(coll["paid_amount"].sum()),
+        "new_leads": len(new), "won": won, "lost": lost,
+        "win_rate": (won / (won + lost)) if (won + lost) else None,
+        "avg_turnaround": (sum(turn) / len(turn)) if turn else None,
+        "on_time": (sum(1 for r in due if r.delivered <= r.deadline) / len(due)) if due else None,
+        "avg_days_to_quote": (sum(qd) / len(qd)) if qd else None,
+    }
+
+
+def breakdown(rf, s, e, col, label):
+    new = rf[_mask(rf["created"], s, e)]
+    deliv = rf[_mask(rf["delivered"], s, e)]
+    keys = sorted({(k or "—") for k in new[col]} | {(k or "—") for k in deliv[col]})
+    rows = []
+    for k in keys:
+        n = new[new[col].replace("", "—") == k]
+        d = deliv[deliv[col].replace("", "—") == k]
+        w, l = int(n["won"].sum()), int(n["lost"].sum())
+        rows.append({label: k, "New leads": len(n), "Won": w, "Lost": l,
+                     "Win rate": (w / (w + l) * 100) if (w + l) else None,
+                     "Delivered": len(d), "Earned": int(d["fee"].sum()),
+                     "Avg fee": float(d["fee"].mean()) if len(d) else None})
+    out = pd.DataFrame(rows, columns=[label, "New leads", "Won", "Lost", "Win rate", "Delivered", "Earned", "Avg fee"])
+    return out.sort_values(["Earned", "New leads"], ascending=False).reset_index(drop=True)
+
+
+def month_range(s, e):
+    out, (y, m) = [], (s.year, s.month)
+    while (y, m) <= (e.year, e.month):
+        out.append(f"{y:04d}-{m:02d}")
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+    return out
+
+
+def monthly_trend(rf, s, e):
+    if s.year < 1990:
+        ds = [d for col in ("created", "delivered", "paid") for d in rf[col] if d]
+        s = min(ds) if ds else e
+    s = max(s, add_years(e, -2))            # cap the chart at 24 months
+    months = month_range(s, e)
+    earned, coll = dict.fromkeys(months, 0), dict.fromkeys(months, 0)
+    for r in rf.itertuples():
+        if _in(r.delivered, s, e):
+            earned[r.delivered.strftime("%Y-%m")] += r.fee
+        if _in(r.paid, s, e):
+            coll[r.paid.strftime("%Y-%m")] += r.paid_amount
+    return pd.DataFrame({"Earned": list(earned.values()), "Collected": list(coll.values())}, index=months)
+
+
+def quarterly_collected(rf, year):
+    q = {f"Q{i}": 0 for i in range(1, 5)}
+    for r in rf.itertuples():
+        if r.paid and r.paid.year == year:
+            q[f"Q{(r.paid.month - 1) // 3 + 1}"] += r.paid_amount
+    return pd.DataFrame({"Quarter": list(q), "Collected": list(q.values())})
+
+
+def receivables(rf, today):
+    ar = rf[rf["earned"] & rf["paid"].isna()].copy() if len(rf) else rf.copy()
+    ar["days"] = [(today - d).days if d else 0 for d in ar["delivered"]]
+    ar["bucket"] = ar["days"].apply(lambda n: "0–30" if n <= 30 else "31–60" if n <= 60 else "61–90" if n <= 90 else "90+")
+    return ar.sort_values("days", ascending=False).reset_index(drop=True)
+
+
+def aging_table(ar):
+    rows = []
+    for b in ["0–30", "31–60", "61–90", "90+"]:
+        sub = ar[ar["bucket"] == b]
+        rows.append({"Days outstanding": b, "Invoices": len(sub), "Amount": int(sub["fee"].sum())})
+    return pd.DataFrame(rows)
+
+
+def pipeline_snapshot(rf, today):
+    q = rf[rf["status"] == "Fee Quoted"]
+    b = rf[rf["status"].isin(["Engaged", "In Progress"])]
+    ar = receivables(rf, today)
+    return {"quoted_n": len(q), "quoted_v": int(q["fee"].sum()), "booked_n": len(b), "booked_v": int(b["fee"].sum()),
+            "ar_n": len(ar), "ar_v": int(ar["fee"].sum())}
+
+
+def followup_list(rf, today, min_idle=3):
+    f = rf[rf["status"].isin(["Inquiry", "Fee Quoted"])].copy()
+    f["idle"] = [(today - d).days if d else 0 for d in f["updated"]]
+    f = f[f["idle"] >= min_idle].sort_values("idle", ascending=False)
+    return f[["id", "client", "phone", "service", "status", "fee", "idle"]].reset_index(drop=True)
+
+
+def retention_table(rf, today):
+    rows = []
+    for r in rf[rf["earned"]].itertuples():
+        until = add_years(r.delivered, 5) if r.delivered else None
+        note = ("If testimony was given, keep until 2 yrs after final disposition of the proceeding if that is later."
+                if r.service in LITIGATION_SERVICES else "")
+        status = "—" if not until else ("Past 5-yr minimum" if until < today else f"{(until - today).days} days left")
+        rows.append({"File #": r.id, "Client": r.client, "Property": r.street, "Service": r.service,
+                     "Delivered": fmt_d(r.delivered), "Retain until (5 yrs)": fmt_d(until), "Status": status,
+                     "Note": note, "_until": until})
+    out = pd.DataFrame(rows, columns=["File #", "Client", "Property", "Service", "Delivered", "Retain until (5 yrs)",
+                                      "Status", "Note", "_until"])
+    return out.sort_values("_until").drop(columns="_until").reset_index(drop=True) if len(out) else out.drop(columns="_until")
+
+
+def disclosure_table(rf):
+    rows = []
+    for r in rf[rf["won"]].itertuples():
+        attested = r.no_interest and r.no_prior
+        rows.append({"File #": r.id, "Client": r.client, "Property": r.street, "Status": r.status,
+                     "No interest": "✅" if r.no_interest else "—", "No prior services (3 yr)": "✅" if r.no_prior else "—",
+                     "Disclosure note": r.disc_note, "Needs attention": not (attested or r.disc_note)})
+    return pd.DataFrame(rows, columns=["File #", "Client", "Property", "Status", "No interest",
+                                       "No prior services (3 yr)", "Disclosure note", "Needs attention"])
+
+
+def accountant_rows(rf, s, e):
+    sel = rf[_mask(rf["delivered"], s, e) | _mask(rf["paid"], s, e)]
+    return pd.DataFrame({
+        "File #": sel["id"], "Client": sel["client"], "Property": sel["street"], "City": sel["city"],
+        "County": sel["county"], "Service": sel["service"], "Source": sel["source"], "Fee": sel["fee"],
+        "Delivered": [fmt_d(d) for d in sel["delivered"]], "Paid date": [fmt_d(d) for d in sel["paid"]],
+        "Amount received": pd.array([int(a) if p else pd.NA for a, p in zip(sel["paid_amount"], sel["paid"])], dtype="Int64"),
+    }).reset_index(drop=True)
+
+
+def _money(x):
+    return f"${x:,.0f}"
+
+
+def _pct(x):
+    return "—" if x is None else f"{x * 100:.0f}%"
+
+
+def _days(x):
+    return "—" if x is None else f"{x:.1f} days"
+
+
+def df_to_md(df):
+    if df.empty:
+        return "_None._\n"
+    cols = list(df.columns)
+    lines = ["| " + " | ".join(cols) + " |", "|" + "|".join("---" for _ in cols) + "|"]
+    for _, r in df.iterrows():
+        lines.append("| " + " | ".join("" if _isblank(r[c]) else str(r[c]) for c in cols) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def report_markdown(rf, s, e, label, today):
+    k = business_kpis(rf, s, e)
+    snap = pipeline_snapshot(rf, today)
+    md = f"""# Business Report — {label}
+**Clearfork Appraisals** · {APPRAISER['name']}
+Period: {fmt_d(s) if s.year > 1990 else 'start'} – {fmt_d(e)} · Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+## Performance
+* Earned (delivered files): **{_money(k['earned'])}** across {k['delivered_n']} file(s), average fee {_money(k['avg_fee'])}
+* Collected (payments received): **{_money(k['collected'])}**
+* New leads: {k['new_leads']} · won {k['won']} · lost {k['lost']} · win rate {_pct(k['win_rate'])}
+* Average turnaround (engaged to delivered): {_days(k['avg_turnaround'])} · on-time delivery: {_pct(k['on_time'])}
+* Average time to first quote: {_days(k['avg_days_to_quote'])}
+
+## Pipeline today
+* Quotes awaiting decision: {snap['quoted_n']} ({_money(snap['quoted_v'])})
+* Booked, in progress: {snap['booked_n']} ({_money(snap['booked_v'])})
+* Delivered, unpaid: {snap['ar_n']} ({_money(snap['ar_v'])})
+
+"""
+    for col, lab in (("service", "Service"), ("county", "County"), ("source", "Lead source")):
+        b = breakdown(rf, s, e, col, lab).copy()
+        b["Win rate"] = b["Win rate"].apply(lambda x: "—" if _isblank(x) else f"{x:.0f}%")
+        b["Earned"] = b["Earned"].apply(_money)
+        b["Avg fee"] = b["Avg fee"].apply(lambda x: "—" if _isblank(x) else _money(x))
+        md += f"## By {lab.lower()}\n{df_to_md(b)}\n"
+    return md
+
+
+# ======================================================================
 # ==== UI ====
 # ======================================================================
 PAGE_PIPELINE = "📊 Pipeline"
 PAGE_NEW = "➕ New Lead"
 PAGE_WORKFILE = "📋 Workfile"
+PAGE_REPORTS = "📈 Reports"
 PAGE_FEES = "💵 Fee Schedule"
-PAGES = [PAGE_PIPELINE, PAGE_NEW, PAGE_WORKFILE, PAGE_FEES]
+PAGES = [PAGE_PIPELINE, PAGE_NEW, PAGE_WORKFILE, PAGE_REPORTS, PAGE_FEES]
 
 CSS = """
 <style>
@@ -1759,6 +2058,11 @@ def page_workfile():
                 deadline = st.date_input("Target delivery date", value=parse_iso(lead["deadline"]) or date.today())
             source = st.selectbox("Lead source", SOURCES,
                                   index=SOURCES.index(lead["source"]) if lead.get("source") in SOURCES else 0)
+            p1, p2 = st.columns(2)
+            paid_on = p1.date_input("Payment received on (leave blank if unpaid)", value=parse_iso(lead.get("paid_date")),
+                                    format="MM/DD/YYYY")
+            paid_amt = p2.number_input("Amount received ($) — 0 uses the quoted fee", min_value=0,
+                                       value=int(lead.get("paid_amount") or 0), step=25)
             notes = st.text_area("Property notes & unique traits (manual appraiser entry)", value=lead["notes"] or "",
                                  height=120, help="Physical defects, unpermitted additions, custom features, access instructions.")
             saved = st.form_submit_button("💾 Save overview", type="primary")
@@ -1766,7 +2070,8 @@ def page_workfile():
             update_lead(lid, log="File details updated", client_name=name.strip(), phone=phone.strip(),
                         email=email.strip(), assignment_type=service, fee=int(fee), street=street.strip(),
                         city=city.strip(), zip=zip_.strip(), county=county, deadline=deadline.isoformat(),
-                        source=source, notes=notes.strip())
+                        source=source, notes=notes.strip(), paid_date=paid_on.isoformat() if paid_on else None,
+                        paid_amount=((int(paid_amt) or int(fee)) if paid_on else None))
             if status != lead["status"]:
                 ok, msg = change_status(lid, status)
                 flash("success" if ok else "error", msg if not ok else "Saved. " + msg)
@@ -1808,6 +2113,17 @@ def page_workfile():
                                        "from Nov 2, 2026. Non-lender work (probate, divorce, tax protest…) is not GSE-delivered, "
                                        "so unmet UAD checks show as warnings rather than errors.")
             with st.container(border=True):
+                st.markdown("#### Disclosures (certification)")
+                no_int = st.checkbox("No present or prospective interest in the property or personal interest in the parties",
+                                     value=bool(lead.get("no_interest")), key=f"noint_{lid}")
+                no_prior = st.checkbox("No services regarding this property in the prior 3 years, in any capacity "
+                                       "(including brokerage)", value=bool(lead.get("no_prior_services")),
+                                       key=f"noprior_{lid}")
+                disc_notes = st.text_area("Disclosure note (required if either box is unchecked)",
+                                          value=lead.get("disclosure_notes") or "", height=70, key=f"discn_{lid}")
+                st.caption("As a licensed broker, check your brokerage history with this property and these parties. "
+                           "Confirm the certification wording against your current USPAP edition.")
+            with st.container(border=True):
                 st.markdown("#### County records vs. measurement")
                 tad = st.number_input("County assessed GLA (SqFt)", min_value=0, step=10,
                                       value=int(lead.get("tad_gla") or 0), key=f"tad_{lid}")
@@ -1846,7 +2162,8 @@ def page_workfile():
             update_lead(lid, log="Subject & scope updated", tad_gla=int(tad), ansi_gla=int(ansi), lot_size=lot,
                         assessed_value=av, tax_year=int(ty), records_source=src,
                         effective_date=eff.isoformat() if eff else None, inspection_type=insp,
-                        inspection_date=insp_date.isoformat() if insp_date else None, gse_required=int(gse),
+                        inspection_date=insp_date.isoformat() if insp_date else None, gse_required=int(gse), no_interest=int(no_int),
+                        no_prior_services=int(no_prior), disclosure_notes=disc_notes,
                         condition_rating=cr, quality_rating=qr, time_basis=tb, market_log=mlog)
             flash("success", "Subject & scope saved.")
             st.rerun()
@@ -1973,6 +2290,178 @@ def page_workfile():
 
 
 # ----------------------------------------------------------------------
+# REPORTS PAGE
+# ----------------------------------------------------------------------
+def page_reports():
+    st.title("📈 Reports")
+    df = list_leads()
+    if df.empty:
+        st.info("No files yet. Add leads (or load sample leads from the sidebar) to see reports.")
+        return
+    rf = report_frame(df)
+    today = date.today()
+
+    pc1, pc2 = st.columns([1, 2])
+    period = pc1.selectbox("Period", PERIODS, index=PERIODS.index("Year to date"), key="rep_period")
+    custom = None
+    if period == "Custom":
+        a, b = pc2.columns(2)
+        custom = (a.date_input("From", value=today - timedelta(days=90), key="rep_from", format="MM/DD/YYYY"),
+                  b.date_input("To", value=today, key="rep_to", format="MM/DD/YYYY"))
+    s, e = period_bounds(period, today, custom)
+    pc2.caption(f"Showing {fmt_d(s) if s.year > 1990 else 'all records'} → {fmt_d(e)}. “Earned” counts files by the date "
+                "they were delivered; “Collected” counts payments by the date received.")
+
+    t_biz, t_ar, t_comp, t_exp = st.tabs(["📊 Business", "💵 Receivables", "🛡️ Compliance & Records", "📤 Export"])
+
+    # ---------------- Business ----------------
+    with t_biz:
+        k = business_kpis(rf, s, e)
+        r1 = st.columns(4)
+        r1[0].metric("Earned (delivered)", _money(k["earned"]))
+        r1[1].metric("Collected", _money(k["collected"]))
+        r1[2].metric("Files delivered", k["delivered_n"])
+        r1[3].metric("Average fee", _money(k["avg_fee"]))
+        r2 = st.columns(5)
+        r2[0].metric("New leads", k["new_leads"])
+        r2[1].metric("Win rate", _pct(k["win_rate"]), help="Won ÷ (won + lost) among leads created in the period. "
+                                                          "Quotes still awaiting a decision are not counted.")
+        r2[2].metric("Avg turnaround", _days(k["avg_turnaround"]), help="Engaged → delivered.")
+        r2[3].metric("On-time delivery", _pct(k["on_time"]), help="Delivered on or before the target delivery date.")
+        r2[4].metric("Avg time to quote", _days(k["avg_days_to_quote"]))
+
+        snap = pipeline_snapshot(rf, today)
+        st.markdown("**Pipeline today**")
+        p = st.columns(3)
+        p[0].metric("Quotes awaiting decision", f"{snap['quoted_n']} · {_money(snap['quoted_v'])}")
+        p[1].metric("Booked / in progress", f"{snap['booked_n']} · {_money(snap['booked_v'])}")
+        p[2].metric("Delivered, unpaid", f"{snap['ar_n']} · {_money(snap['ar_v'])}")
+
+        trend = monthly_trend(rf, s, e)
+        st.markdown("**Monthly trend**")
+        if trend.sum().sum() > 0:
+            st.bar_chart(trend, stack=False)
+        else:
+            st.caption("No earned or collected revenue in this period yet.")
+
+        dim = st.radio("Break down by", ["Service", "County", "Lead source"], horizontal=True, key="rep_dim")
+        col = {"Service": "service", "County": "county", "Lead source": "source"}[dim]
+        bd = breakdown(rf, s, e, col, dim)
+        st.dataframe(bd, hide_index=True, column_config={
+            "Win rate": st.column_config.NumberColumn(format="%.0f%%"),
+            "Earned": st.column_config.NumberColumn(format="$%d"),
+            "Avg fee": st.column_config.NumberColumn(format="$%d")})
+        st.caption("Lead-source win rates show which channels are worth your time — a source with many leads and few wins "
+                   "is a candidate for less effort.")
+
+        st.markdown("**Follow-ups: leads idle 3+ days**")
+        fu = followup_list(rf, today)
+        if fu.empty:
+            st.success("Nothing waiting — every inquiry and quote has been touched in the last 3 days.")
+        else:
+            st.dataframe(fu.rename(columns={"id": "File #", "client": "Client", "phone": "Phone", "service": "Service",
+                                            "status": "Status", "fee": "Quoted fee", "idle": "Idle days"}),
+                         hide_index=True, column_config={"Quoted fee": st.column_config.NumberColumn(format="$%d")})
+
+        st.markdown(f"**Collected by quarter, {today.year}** (for estimated-tax planning; this is not tax advice)")
+        st.dataframe(quarterly_collected(rf, today.year), hide_index=True,
+                     column_config={"Collected": st.column_config.NumberColumn(format="$%d")})
+
+    # ---------------- Receivables ----------------
+    with t_ar:
+        ar = receivables(rf, today)
+        a = st.columns(4)
+        a[0].metric("Outstanding", _money(int(ar["fee"].sum())))
+        a[1].metric("Unpaid invoices", len(ar))
+        a[2].metric("Oldest", f"{int(ar['days'].max())} days" if len(ar) else "—")
+        a[3].metric("Collected in period", _money(business_kpis(rf, s, e)["collected"]))
+        if ar.empty:
+            st.success("No outstanding invoices — everything delivered has been paid.")
+        else:
+            st.markdown("**Aging**")
+            st.dataframe(aging_table(ar), hide_index=True,
+                         column_config={"Amount": st.column_config.NumberColumn(format="$%d")})
+            st.markdown("**Delivered, not yet paid** — check the files that have paid, then record them.")
+            view = pd.DataFrame({
+                "File #": ar["id"], "Client": ar["client"], "Property": ar["street"], "Service": ar["service"],
+                "Fee": ar["fee"], "Delivered": [fmt_d(d) for d in ar["delivered"]], "Days": ar["days"],
+                "Paid": False})
+            edited = st.data_editor(view, hide_index=True, key="ar_editor",
+                                    disabled=[c for c in view.columns if c != "Paid"],
+                                    column_config={"Fee": st.column_config.NumberColumn(format="$%d"),
+                                                   "Paid": st.column_config.CheckboxColumn("Paid ✓")})
+            pay_date = st.date_input("Payment received on", value=today, key="ar_date", format="MM/DD/YYYY")
+            if st.button("💾 Record payments for checked files", type="primary"):
+                checked = edited[edited["Paid"]]
+                for _, r in checked.iterrows():
+                    update_lead(int(r["File #"]), paid_date=pay_date.isoformat(), paid_amount=int(r["Fee"]),
+                                log=f"Payment received ${int(r['Fee']):,} on {fmt_d(pay_date)}")
+                flash("success" if len(checked) else "warning",
+                      f"Recorded {len(checked)} payment(s)." if len(checked) else "Nothing was checked.")
+                st.rerun()
+            st.caption("Different amount or a partial payment? Enter it on the file's Overview tab (Payment received).")
+
+    # ---------------- Compliance & records ----------------
+    with t_comp:
+        st.markdown("#### Interest and prior-services disclosures")
+        st.caption("For every engaged or delivered file: confirm you have no present or prospective interest in the property "
+                   "or parties, and no services on the property in the prior 3 years in any capacity — which includes "
+                   "brokerage work. If either is not true, record the disclosure note instead. Set these on each file's "
+                   "Subject & Scope tab. Confirm the exact certification wording against your current USPAP edition.")
+        dt = disclosure_table(rf)
+        need = dt[dt["Needs attention"]] if len(dt) else dt
+        if dt.empty:
+            st.info("No engaged files yet.")
+        elif need.empty:
+            st.success("Every engaged or delivered file has its disclosures addressed.")
+        else:
+            st.warning(f"{len(need)} file(s) need a disclosure confirmation or note.")
+            st.dataframe(need.drop(columns="Needs attention"), hide_index=True)
+
+        st.markdown("#### Workfile retention")
+        st.caption("USPAP's Record Keeping Rule: keep the workfile for the longer of 5 years after preparation, or 2 years "
+                   "after final disposition of any judicial proceeding in which you gave testimony. State enforcement and "
+                   "civil-liability periods can run longer, so treat this as a minimum and confirm against current USPAP and "
+                   "TALCB rules. Nothing is deleted by this app.")
+        rt = retention_table(rf, today)
+        if rt.empty:
+            st.info("No delivered files yet.")
+        else:
+            st.dataframe(rt, hide_index=True)
+
+        st.markdown("#### Engaged files not yet UAD-ready")
+        rows = []
+        for rec in df.to_dict("records"):
+            if rec["status"] in ("Engaged", "In Progress"):
+                d, t = readiness_counts(rec)
+                if d < t:
+                    rows.append({"File #": rec["id"], "Client": rec["client_name"], "Property": rec["street"],
+                                 "UAD checks": f"{d}/{t}", "Due": due_label(rec["deadline"], rec["status"])})
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True)
+        else:
+            st.success("No engaged files with open UAD checks.")
+
+    # ---------------- Export ----------------
+    with t_exp:
+        label = period if period != "Custom" else f"{fmt_d(s)}–{fmt_d(e)}"
+        slug_label = slug(label.lower())
+        acct = accountant_rows(rf, s, e)
+        st.markdown(f"**Accountant / bookkeeping export — {label}**  ·  {len(acct)} file(s) delivered or paid in the period")
+        if len(acct):
+            st.dataframe(acct, hide_index=True)
+        c1, c2, c3 = st.columns(3)
+        c1.download_button("📊 Files & payments (.csv)", acct.to_csv(index=False),
+                           file_name=f"files_and_payments_{slug_label}.csv", mime="text/csv")
+        c2.download_button("📈 Monthly summary (.csv)", monthly_trend(rf, s, e).to_csv(index_label="Month"),
+                           file_name=f"monthly_summary_{slug_label}.csv", mime="text/csv")
+        c3.download_button("📄 Business report (.md)", report_markdown(rf, s, e, label, today),
+                           file_name=f"business_report_{slug_label}.md", mime="text/markdown")
+        st.caption("Revenue is shown by delivery date and by payment date. Which one your books use depends on your "
+                   "accounting method — ask your accountant.")
+
+
+# ----------------------------------------------------------------------
 # FEE SCHEDULE PAGE
 # ----------------------------------------------------------------------
 def page_fees():
@@ -2000,9 +2489,31 @@ def page_fees():
 # ----------------------------------------------------------------------
 # MAIN
 # ----------------------------------------------------------------------
+def require_password():
+    """Optional login gate. Active only when an `app_password` secret is configured
+    (Streamlit Cloud: App settings -> Secrets; locally: .streamlit/secrets.toml)."""
+    try:
+        pw = st.secrets.get("app_password")
+    except Exception:  # noqa: BLE001  (no secrets file at all)
+        pw = None
+    if not pw or st.session_state.get("_authed"):
+        return
+    st.title("🔒 Appraisal Desk")
+    with st.form("login"):
+        entered = st.text_input("Password", type="password")
+        ok = st.form_submit_button("Sign in", type="primary")
+    if ok:
+        if hmac.compare_digest(entered.encode(), str(pw).encode()):
+            st.session_state["_authed"] = True
+            st.rerun()
+        st.error("Incorrect password.")
+    st.stop()
+
+
 def main():
     st.set_page_config(page_title="Appraisal Desk | Clearfork Appraisals", page_icon="🏠", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
+    require_password()
     init_db()
 
     if "_goto" in st.session_state:
@@ -2012,8 +2523,9 @@ def main():
     with st.sidebar:
         st.header("⚖️ Appraisal Desk")
         st.caption("Clearfork Appraisals")
-        st.text(f"Appraiser: {APPRAISER['name']}")
-        st.text(f"License: TX {APPRAISER['license']}")
+        st.text(f"{APPRAISER['name']}")
+        st.text(f"Appraiser: TX {APPRAISER['license']}")
+        st.text(f"Broker: TX {APPRAISER['broker_license']}")
         st.text("Coverage: Tarrant & surrounding")
         st.markdown("---")
         st.radio("Navigate", PAGES, key="page")
@@ -2050,6 +2562,8 @@ def main():
         page_new_lead()
     elif page == PAGE_WORKFILE:
         page_workfile()
+    elif page == PAGE_REPORTS:
+        page_reports()
     else:
         page_fees()
 
