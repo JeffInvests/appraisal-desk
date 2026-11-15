@@ -21,7 +21,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "v2.3"
+APP_VERSION = "v2.4"
 DB_PATH = os.environ.get("APPRAISAL_DB", "appraisal_desk.db")
 BACKUP_ROOT = "Appraisal_Files_Active"
 
@@ -31,6 +31,10 @@ APPRAISER = {
     "license": "1360232-CR",
     "broker_designation": "Texas Real Estate Broker",
     "broker_license": "0686157",          # as supplied by the user -- verify against TREC
+    "firm": "Clearfork Appraisals",
+    "address": "7725 Whisterwheel Way, Fort Worth, TX 76123",   # public business listing
+    "phone": "(817) 903-4509",
+    "website": "clearforkappraisals.com",
 }
 
 STATUSES = ["Inquiry", "Fee Quoted", "Engaged", "In Progress", "Delivered", "Closed", "Lost"]
@@ -273,9 +277,9 @@ def change_status(lid, new_status):
         return True, "Status unchanged."
     if new_status in ("Engaged", "In Progress"):
         if not lead.get("fee"):
-            return False, "Set a quoted fee before engaging this file (Workfile → Overview)."
+            return False, "Set a quoted fee before engaging this file (Working Files → Overview)."
         if not parse_iso(lead.get("deadline")):
-            return False, "Set a firm delivery date before engaging this file (Workfile → Overview)."
+            return False, "Set a firm delivery date before engaging this file (Working Files → Overview)."
     fields = {"status": new_status}
     if new_status == "Closed":
         fields["closed_at"] = now_str()
@@ -1162,7 +1166,8 @@ def build_json(lead, calc, unused, items):
 def build_markdown(lead, calc, unused, items):
     md = f"""# Appraisal Assignment Audit Summary
 **Clearfork Appraisals**
-*{APPRAISER['name']}, {APPRAISER['designation']} (TALCB #{APPRAISER['license']}) · {APPRAISER['broker_designation']} (#{APPRAISER['broker_license']})*
+*{APPRAISER['name']}, {APPRAISER['designation']} (TALCB #{APPRAISER['license']}) · {APPRAISER['broker_designation']} (#{APPRAISER['broker_license']})*  
+*{APPRAISER['firm']} · {APPRAISER['address']} · {APPRAISER['phone']}*
 *Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*
 
 ---
@@ -1480,7 +1485,7 @@ def report_markdown(rf, s, e, label, today, exp=None, mil=None, basis="cash"):
     k = business_kpis(rf, s, e)
     snap = pipeline_snapshot(rf, today)
     md = f"""# Business Report — {label}
-**Clearfork Appraisals** · {APPRAISER['name']}
+**{APPRAISER['firm']}** · {APPRAISER['name']} · {APPRAISER['address']} · {APPRAISER['phone']}
 Period: {fmt_d(s) if s.year > 1990 else 'start'} – {fmt_d(e)} · Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}
 
 ## Performance
@@ -1669,15 +1674,137 @@ def pnl_markdown(p, label, basis):
 
 
 
+# ======================================================================
+# DASHBOARD DATA
+# ======================================================================
+# Approximate city-center coordinates (lat, lon) for every city the app recognises.
+CITY_COORDS = {
+    "fort worth": (32.7555, -97.3308), "arlington": (32.7357, -97.1081), "southlake": (32.9412, -97.1342),
+    "keller": (32.9346, -97.2517), "colleyville": (32.8809, -97.1500), "grapevine": (32.9343, -97.0781),
+    "north richland hills": (32.8343, -97.2289), "richland hills": (32.8123, -97.2286), "hurst": (32.8235, -97.1706),
+    "euless": (32.8371, -97.0820), "bedford": (32.8441, -97.1431), "mansfield": (32.5632, -97.1417),
+    "burleson": (32.5421, -97.3208), "haltom city": (32.7996, -97.2692), "watauga": (32.8579, -97.2547),
+    "benbrook": (32.6732, -97.4606), "saginaw": (32.8601, -97.3636), "azle": (32.8946, -97.5428),
+    "crowley": (32.5790, -97.3625), "haslet": (32.9640, -97.3392), "white settlement": (32.7596, -97.4589),
+    "river oaks": (32.7773, -97.3950), "lake worth": (32.8068, -97.4339), "kennedale": (32.6468, -97.2250),
+    "forest hill": (32.6724, -97.2670), "everman": (32.6307, -97.2897), "westworth village": (32.7568, -97.4039),
+    "pantego": (32.7143, -97.1636), "dalworthington gardens": (32.7060, -97.1569), "blue mound": (32.8618, -97.3292),
+    "weatherford": (32.7593, -97.7973), "aledo": (32.6962, -97.6022), "willow park": (32.7515, -97.6522),
+    "hudson oaks": (32.7507, -97.7114), "springtown": (32.9693, -97.6842), "annetta": (32.7165, -97.6836),
+    "cleburne": (32.3476, -97.3867), "joshua": (32.4615, -97.3892), "alvarado": (32.4068, -97.2120),
+    "keene": (32.3965, -97.3225),
+    "denton": (33.2148, -97.1331), "lewisville": (33.0462, -96.9942), "flower mound": (33.0146, -97.0970),
+    "roanoke": (33.0040, -97.2259), "trophy club": (32.9987, -97.1836), "justin": (33.0848, -97.2967),
+    "argyle": (33.1210, -97.1833), "northlake": (33.0968, -97.2614), "corinth": (33.1540, -97.0647),
+    "highland village": (33.0912, -97.0467), "the colony": (33.0890, -96.8864), "frisco": (33.1507, -96.8236),
+    "dallas": (32.7767, -96.7970), "irving": (32.8140, -96.9489), "grand prairie": (32.7460, -96.9978),
+    "garland": (32.9126, -96.6389), "richardson": (32.9483, -96.7299), "duncanville": (32.6518, -96.9083),
+    "desoto": (32.5899, -96.8570), "mesquite": (32.7668, -96.5992),
+    "decatur": (33.2343, -97.5864), "bridgeport": (33.2101, -97.7536), "granbury": (32.4421, -97.7942),
+    "waxahachie": (32.3865, -96.8483),
+}
+COUNTY_COORDS = {"Tarrant": (32.77, -97.29), "Parker": (32.78, -97.80), "Johnson": (32.38, -97.37),
+                 "Denton": (33.21, -97.13), "Dallas": (32.77, -96.80), "Wise": (33.22, -97.65),
+                 "Hood": (32.44, -97.79), "Ellis": (32.36, -96.80)}
+PIPELINE_STATUSES = ["Inquiry", "Fee Quoted", "Engaged", "In Progress"]
+MAP_VIEWS = {"In the pipeline": PIPELINE_STATUSES, "Delivered work": EARNED,
+             "All (except lost)": PIPELINE_STATUSES + EARNED}
+MAP_COLORS = {"In the pipeline": "#1f77b4", "Delivered work": "#2ca02c", "All (except lost)": "#9467bd"}
+
+
+def lead_place(city, county):
+    """(label, (lat, lon)) for a file; city centre if known, else the county centre, else None."""
+    c = (city or "").strip().lower()
+    if c in CITY_COORDS:
+        return c.title(), CITY_COORDS[c]
+    cy = (county or "").strip()
+    if cy in COUNTY_COORDS:
+        return f"{cy} County (no city match)", COUNTY_COORDS[cy]
+    return None, None
+
+
+def map_points(df, view="In the pipeline"):
+    """One row per place with the number of files and fee value. Returns (points, n_unplaced)."""
+    sel = df[df["status"].isin(MAP_VIEWS[view])]
+    agg, unplaced = {}, 0
+    for r in sel.itertuples():
+        label, xy = lead_place(r.city, r.county)
+        if not xy:
+            unplaced += 1
+            continue
+        a = agg.setdefault(label, {"Place": label, "Files": 0, "Fees": 0, "lat": xy[0], "lon": xy[1]})
+        a["Files"] += 1
+        a["Fees"] += int(r.fee or 0)
+    pts = pd.DataFrame(list(agg.values()), columns=["Place", "Files", "Fees", "lat", "lon"])
+    if len(pts):
+        pts["size"] = (1800 + 1400 * pts["Files"]).clip(upper=9000)
+        pts["color"] = MAP_COLORS[view]
+        pts = pts.sort_values("Files", ascending=False).reset_index(drop=True)
+    return pts, unplaced
+
+
+def due_soon(df, today, n=8):
+    """Open pipeline files by target delivery date, soonest first (no-date files last)."""
+    sel = df[df["status"].isin(PIPELINE_STATUSES)].copy()
+    sel["_d"] = sel["deadline"].apply(parse_iso)
+    sel["_k"] = sel["_d"].apply(lambda d: d if d else date(2999, 1, 1))
+    sel = sel.sort_values(["_k", "id"]).head(n)
+    return pd.DataFrame({
+        "id": sel["id"].values, "Due": [due_label(d.isoformat() if d else None, st_) for d, st_ in zip(sel["_d"], sel["status"])],
+        "Client": sel["client_name"].fillna("").values, "Property": sel["street"].fillna("").values,
+        "Service": sel["assignment_type"].fillna("").values, "Status": sel["status"].values,
+        "Fee": sel["fee"].fillna(0).astype(int).values})
+
+
+def stage_counts(df):
+    rows = []
+    for i, stg in enumerate(PIPELINE_STATUSES, 1):
+        sub = df[df["status"] == stg]
+        rows.append({"Stage": f"{i} · {stg}", "Files": len(sub), "Fees": int(sub["fee"].fillna(0).sum())})
+    return pd.DataFrame(rows)
+
+
+def recent_activity(limit=8):
+    with db() as c:
+        rows = c.execute(
+            "SELECT a.ts, a.message, a.lead_id, l.client_name, l.street FROM activity a "
+            "LEFT JOIN leads l ON l.id = a.lead_id ORDER BY a.id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _vs_last(cur, prev):
+    d = cur - prev
+    if not cur and not prev:
+        return None
+    return f"{'+' if d >= 0 else '-'}${abs(d):,.0f} vs last month"
+
+
+def due_label(deadline, status):
+    d = parse_iso(deadline)
+    if status in TERMINAL:
+        return "—"
+    if not d:
+        return "No date"
+    delta = (d - date.today()).days
+    if delta < 0:
+        return f"🔴 {abs(delta)}d overdue"
+    if delta == 0:
+        return "🟠 Today"
+    if delta <= 3:
+        return f"🟠 {d:%b %d} ({delta}d)"
+    return f"{d:%b %d} ({delta}d)"
+
+
 # ==== UI ====
 # ======================================================================
+PAGE_DASH = "🏠 Dashboard"
 PAGE_PIPELINE = "📊 Pipeline"
 PAGE_NEW = "➕ New Lead"
-PAGE_WORKFILE = "📋 Workfile"
-PAGE_REPORTS = "📈 Reports"
+PAGE_WORKFILE = "📋 Working Files"
+PAGE_REPORTS = "📈 Run Reports"
 PAGE_FEES = "💵 Fee Schedule"
 PAGE_BOOKS = "🧾 Expenses & Mileage"
-PAGES = [PAGE_PIPELINE, PAGE_NEW, PAGE_WORKFILE, PAGE_REPORTS, PAGE_BOOKS, PAGE_FEES]
+PAGES = [PAGE_DASH, PAGE_NEW, PAGE_PIPELINE, PAGE_WORKFILE, PAGE_REPORTS, PAGE_BOOKS, PAGE_FEES]
 
 CSS = """
 <style>
@@ -1709,22 +1836,6 @@ def show_flash():
         {"success": st.success, "error": st.error, "warning": st.warning}.get(f[0], st.info)(f[1])
 
 
-def due_label(deadline, status):
-    d = parse_iso(deadline)
-    if status in TERMINAL:
-        return "—"
-    if not d:
-        return "No date"
-    delta = (d - date.today()).days
-    if delta < 0:
-        return f"🔴 {abs(delta)}d overdue"
-    if delta == 0:
-        return "🟠 Today"
-    if delta <= 3:
-        return f"🟠 {d:%b %d} ({delta}d)"
-    return f"{d:%b %d} ({delta}d)"
-
-
 # ----------------------------------------------------------------------
 # PIPELINE PAGE (home)
 # ----------------------------------------------------------------------
@@ -1754,7 +1865,7 @@ def render_detail(lid):
             ok, msg = change_status(lid, new_status)
             flash("success" if ok else "error", msg)
             st.rerun()
-        if st.button("📋 Open Workfile", key=f"open_{lid}", type="primary"):
+        if st.button("📋 Open working file", key=f"open_{lid}", type="primary"):
             goto(PAGE_WORKFILE, lid)
 
     with c3:
@@ -1774,6 +1885,112 @@ def render_detail(lid):
             delete_lead(lid)
             flash("success", "File deleted.")
             st.rerun()
+
+
+# ----------------------------------------------------------------------
+# DASHBOARD PAGE (landing)
+# ----------------------------------------------------------------------
+def page_dashboard():
+    today = date.today()
+    h1, h2 = st.columns([4, 1], vertical_alignment="center")
+    h1.title("🏠 Dashboard")
+    h1.caption(f"{APPRAISER['firm']} · {today:%A, %B %d, %Y} · Welcome back, {APPRAISER['name'].split()[0]}.")
+    if h2.button("➕ New lead", type="primary", use_container_width=True, key="dash_new"):
+        goto(PAGE_NEW)
+    df = list_leads()
+    if df.empty:
+        st.info("No files yet — add your first lead, or load sample leads from the sidebar to see the dashboard filled in.")
+        return
+
+    rf = report_frame(df)
+    exp, mil = load_expenses(), load_mileage()
+    snap = pipeline_snapshot(rf, today)
+    due = df[df["status"].isin(PIPELINE_STATUSES)].copy()
+    due["_d"] = due["deadline"].apply(parse_iso)
+    n_over = int(due["_d"].apply(lambda d: d is not None and d < today).sum())
+    n_soon = int(due["_d"].apply(lambda d: d is not None and 0 <= (d - today).days <= 3).sum())
+    fu = followup_list(rf, today)
+
+    if n_over:
+        st.error(f"🔴 {n_over} file(s) are past their target delivery date — see Due soon below.")
+
+    # ---- needs attention ----
+    a = st.columns(4)
+    a[0].metric("Past due", n_over, help="Open files whose target delivery date has passed.")
+    a[1].metric("Due in 3 days", n_soon)
+    a[2].metric("Follow-ups waiting", len(fu), help="Inquiries and quotes untouched for 3+ days.")
+    a[3].metric("Delivered, unpaid", f"{snap['ar_n']} · {_money(snap['ar_v'])}")
+
+    # ---- due soon + pipeline ----
+    left, right = st.columns([3, 2])
+    with left:
+        with st.container(border=True):
+            st.markdown("**📅 Due soon**")
+            ds = due_soon(df, today)
+            if ds.empty:
+                st.caption("No open files with a delivery date.")
+            else:
+                ev = st.dataframe(ds.drop(columns="id"), hide_index=True, on_select="rerun", selection_mode="single-row",
+                                  key="dash_due", column_config={"Fee": st.column_config.NumberColumn(format="$%d")})
+                rows = ev.selection.rows if ev and ev.selection else []
+                if st.button("📋 Open selected file", disabled=not rows, key="dash_open"):
+                    goto(PAGE_WORKFILE, int(ds.iloc[rows[0]]["id"]))
+                st.caption("Click a row, then open it.")
+    with right:
+        with st.container(border=True):
+            st.markdown("**🧭 Pipeline**")
+            sc = stage_counts(df)
+            if sc["Files"].sum():
+                st.bar_chart(sc.set_index("Stage")["Files"], horizontal=True, height=190)
+            m = st.columns(2)
+            m[0].metric("Quotes out", f"{snap['quoted_n']} · {_money(snap['quoted_v'])}")
+            m[1].metric("Booked", f"{snap['booked_n']} · {_money(snap['booked_v'])}")
+            if st.button("Open full pipeline →", key="dash_pipe"):
+                goto(PAGE_PIPELINE)
+
+    # ---- this month ----
+    ms, me = period_bounds("This month", today)
+    ps, pe = period_bounds("Last month", today)
+    cur, prev = pnl(rf, exp, mil, ms, me, "cash"), pnl(rf, exp, mil, ps, pe, "cash")
+    earned = business_kpis(rf, ms, me)["earned"]
+    with st.container(border=True):
+        st.markdown(f"**💰 {today:%B}** (cash basis)")
+        k = st.columns(4)
+        k[0].metric("Collected", _money(cur["revenue"]), delta=_vs_last(cur["revenue"], prev["revenue"]))
+        k[1].metric("Earned (delivered)", _money(earned))
+        k[2].metric("Expenses + mileage", _money(cur["expenses"] + cur["mileage"]))
+        k[3].metric("Net", _money(cur["net"]), delta=_vs_last(cur["net"], prev["net"]))
+        tr = monthly_pnl(rf, exp, mil, add_months(today.replace(day=1), -5), today, "cash")
+        if tr[["Revenue", "Costs"]].sum().sum() > 0:
+            st.bar_chart(tr[["Revenue", "Costs"]], stack=False, height=210)
+        else:
+            st.caption("Revenue and costs for the last six months will chart here once payments and expenses are recorded.")
+
+    # ---- map + activity ----
+    mcol, acol = st.columns([3, 2])
+    with mcol:
+        with st.container(border=True):
+            st.markdown("**🗺️ Where the work is**")
+            view = st.radio("Show", list(MAP_VIEWS), horizontal=True, key="dash_map_view", label_visibility="collapsed")
+            pts, unplaced = map_points(df, view)
+            if pts.empty:
+                st.caption("No files to plot for this view yet.")
+            else:
+                st.map(pts, latitude="lat", longitude="lon", size="size", color="color", zoom=8, height=330)
+                st.dataframe(pts[["Place", "Files", "Fees"]], hide_index=True, height=150,
+                             column_config={"Fees": st.column_config.NumberColumn(format="$%d")})
+            st.caption("Each dot is a city centre sized by file count — not the property's street address."
+                       + (f" {unplaced} file(s) have no recognised city or county." if unplaced else ""))
+    with acol:
+        with st.container(border=True):
+            st.markdown("**🕒 Recent activity**")
+            acts = recent_activity(8)
+            if not acts:
+                st.caption("Nothing yet.")
+            for r in acts:
+                who = r["client_name"] or "—"
+                st.markdown(f"**{who}** — {r['message']}  \n<span style='color:gray;font-size:0.8em'>{(r['ts'] or '')[:16]}</span>",
+                            unsafe_allow_html=True)
 
 
 def page_pipeline():
@@ -1998,7 +2215,7 @@ def page_new_lead():
             if b1.button("📊 View in pipeline"):
                 st.session_state.pop("last_created")
                 goto(PAGE_PIPELINE)
-            if b2.button("📋 Open workfile"):
+            if b2.button("📋 Open working file"):
                 st.session_state.pop("last_created")
                 goto(PAGE_WORKFILE, lc)
         else:
@@ -2174,7 +2391,7 @@ def adjustment_helpers_ui(lid, lead, edited, ver_key, ver):
 
 
 def page_workfile():
-    st.title("📋 Workfile")
+    st.title("📋 Working Files")
     df = list_leads()
     if df.empty:
         st.info("No files yet. Add a lead first.")
@@ -2467,7 +2684,7 @@ def page_workfile():
 # REPORTS PAGE
 # ----------------------------------------------------------------------
 def page_reports():
-    st.title("📈 Reports")
+    st.title("📈 Run Reports")
     df = list_leads()
     if df.empty:
         st.info("No files yet. Add leads (or load sample leads from the sidebar) to see reports.")
@@ -2903,11 +3120,12 @@ def main():
 
     if "_goto" in st.session_state:
         st.session_state["page"] = st.session_state.pop("_goto")
-    st.session_state.setdefault("page", PAGE_PIPELINE)
+    st.session_state.setdefault("page", PAGE_DASH)
 
     with st.sidebar:
         st.header("⚖️ Appraisal Desk")
         st.caption("Clearfork Appraisals")
+        st.text(f"{APPRAISER['firm']}")
         st.text(f"{APPRAISER['name']}")
         st.text(f"Appraiser: TX {APPRAISER['license']}")
         st.text(f"Broker: TX {APPRAISER['broker_license']}")
@@ -2941,7 +3159,9 @@ def main():
     page = st.session_state["page"]
     if page != PAGE_NEW:
         st.session_state.pop("last_created", None)
-    if page == PAGE_PIPELINE:
+    if page == PAGE_DASH:
+        page_dashboard()
+    elif page == PAGE_PIPELINE:
         page_pipeline()
     elif page == PAGE_NEW:
         page_new_lead()
