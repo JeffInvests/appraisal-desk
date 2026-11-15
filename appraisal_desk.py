@@ -21,7 +21,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "v2.4"
+APP_VERSION = "v2.4.1"
 DB_PATH = os.environ.get("APPRAISAL_DB", "appraisal_desk.db")
 BACKUP_ROOT = "Appraisal_Files_Active"
 
@@ -165,8 +165,7 @@ def db():
         conn.close()
 
 
-@st.cache_resource
-def init_db():
+def init_db():  # cheap and idempotent: runs on every load so code updates always migrate the DB
     with db() as c:
         c.execute("CREATE TABLE IF NOT EXISTS leads (id INTEGER PRIMARY KEY AUTOINCREMENT)")
         existing = {r["name"] for r in c.execute("PRAGMA table_info(leads)")}
