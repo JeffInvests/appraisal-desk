@@ -21,7 +21,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "v2.2"
+APP_VERSION = "v2.3"
 DB_PATH = os.environ.get("APPRAISAL_DB", "appraisal_desk.db")
 BACKUP_ROOT = "Appraisal_Files_Active"
 
@@ -132,6 +132,7 @@ LEAD_COLS = {
     "unused_json": "TEXT",
     "paid_date": "TEXT", "paid_amount": "INTEGER",
     "no_interest": "INTEGER", "no_prior_services": "INTEGER", "disclosure_notes": "TEXT",
+    "hours": "REAL",
 }
 
 
@@ -173,6 +174,12 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         c.execute("""CREATE TABLE IF NOT EXISTS fees (
             service TEXT PRIMARY KEY, fee INTEGER, sort INTEGER)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, category TEXT, vendor TEXT, description TEXT,
+            amount REAL, lead_id INTEGER, receipt INTEGER, created_at TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS mileage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, miles REAL, rate REAL, origin TEXT,
+            destination TEXT, purpose TEXT, lead_id INTEGER, created_at TEXT)""")
         if c.execute("SELECT COUNT(*) FROM fees").fetchone()[0] == 0:
             for i, (svc, fee) in enumerate(DEFAULT_FEES.items()):
                 c.execute("INSERT INTO fees (service, fee, sort) VALUES (?,?,?)", (svc, fee, i))
@@ -1224,7 +1231,7 @@ PERIODS = ["This month", "Last month", "This quarter", "Year to date", "Last 12 
 STATUS_RE = re.compile(r"^Status: (.+) → (.+)$")
 RF_COLS = ["id", "client", "phone", "street", "city", "county", "service", "status", "source", "fee", "created",
            "updated", "quote", "engaged", "delivered", "deadline", "paid", "paid_amount", "won", "lost", "earned",
-           "no_interest", "no_prior", "disc_note"]
+           "no_interest", "no_prior", "disc_note", "hours"]
 
 
 def status_history():
@@ -1297,6 +1304,7 @@ def report_frame(df):
             "won": status in WON, "lost": status == "Lost", "earned": status in EARNED,
             "no_interest": bool(rec.get("no_interest")), "no_prior": bool(rec.get("no_prior_services")),
             "disc_note": (rec.get("disclosure_notes") or "").strip(),
+            "hours": float(rec.get("hours") or 0),
         })
     return pd.DataFrame(rows, columns=RF_COLS)
 
@@ -1447,7 +1455,7 @@ def accountant_rows(rf, s, e):
 
 
 def _money(x):
-    return f"${x:,.0f}"
+    return f"-${abs(x):,.0f}" if round(x) < 0 else f"${x:,.0f}"
 
 
 def _pct(x):
@@ -1468,7 +1476,7 @@ def df_to_md(df):
     return "\n".join(lines) + "\n"
 
 
-def report_markdown(rf, s, e, label, today):
+def report_markdown(rf, s, e, label, today, exp=None, mil=None, basis="cash"):
     k = business_kpis(rf, s, e)
     snap = pipeline_snapshot(rf, today)
     md = f"""# Business Report — {label}
@@ -1494,10 +1502,173 @@ Period: {fmt_d(s) if s.year > 1990 else 'start'} – {fmt_d(e)} · Generated {da
         b["Earned"] = b["Earned"].apply(_money)
         b["Avg fee"] = b["Avg fee"].apply(lambda x: "—" if _isblank(x) else _money(x))
         md += f"## By {lab.lower()}\n{df_to_md(b)}\n"
+    if exp is not None and mil is not None:
+        md += "\n" + pnl_markdown(pnl(rf, exp, mil, s, e, basis), label, basis)
     return md
 
 
 # ======================================================================
+# ======================================================================
+# EXPENSES, MILEAGE & PROFIT AND LOSS
+# ======================================================================
+EXPENSE_CATEGORIES = [
+    "MLS & data subscriptions", "E&O / liability insurance", "Licenses, dues & continuing education",
+    "Software & technology", "Office & supplies", "Marketing & advertising", "Phone & internet",
+    "Vehicle (non-mileage)", "Travel & meals", "Equipment", "Professional services (legal / accounting)",
+    "Other",
+]
+MILEAGE_PURPOSES = ["Property inspection", "Comparable drive-by", "Client meeting", "ARB hearing / courthouse",
+                    "Closing / delivery", "Other"]
+# IRS standard business mileage rate by year ($/mile). Each trip stores the rate it was logged with.
+MILEAGE_RATES = {2025: 0.70, 2026: 0.725}
+EXP_COLS = ["id", "date", "category", "vendor", "description", "amount", "lead_id", "receipt"]
+MIL_COLS = ["id", "date", "miles", "rate", "origin", "destination", "purpose", "lead_id"]
+
+
+def default_mileage_rate(d):
+    yrs = sorted(MILEAGE_RATES)
+    return MILEAGE_RATES.get(d.year, MILEAGE_RATES[yrs[-1]] if d.year > yrs[-1] else MILEAGE_RATES[yrs[0]])
+
+
+def add_months(d, n):
+    y, m = divmod(d.month - 1 + n, 12)
+    y, m = d.year + y, m + 1
+    last = [31, 29 if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]
+    return date(y, m, min(d.day, last))
+
+
+def add_expense(d, category, vendor, description, amount, lead_id=None, receipt=False):
+    with db() as c:
+        cur = c.execute("INSERT INTO expenses (date, category, vendor, description, amount, lead_id, receipt, created_at) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (d.isoformat(), category, vendor, description, round(float(amount), 2),
+                         int(lead_id) if lead_id else None, int(bool(receipt)), now_str()))
+        return cur.lastrowid
+
+
+def add_trip(d, miles, rate, origin, destination, purpose, lead_id=None):
+    with db() as c:
+        cur = c.execute("INSERT INTO mileage (date, miles, rate, origin, destination, purpose, lead_id, created_at) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (d.isoformat(), round(float(miles), 1), float(rate), origin, destination, purpose,
+                         int(lead_id) if lead_id else None, now_str()))
+        return cur.lastrowid
+
+
+def _read(table, cols):
+    with db() as c:
+        df = pd.read_sql_query(f"SELECT {', '.join(cols)} FROM {table} ORDER BY date DESC, id DESC", c)
+    df["date"] = df["date"].apply(parse_iso)
+    return df
+
+
+def load_expenses():
+    df = _read("expenses", EXP_COLS)
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    df["receipt"] = df["receipt"].fillna(0).astype(int).astype(bool)
+    return df
+
+
+def load_mileage():
+    df = _read("mileage", MIL_COLS)
+    df["miles"] = pd.to_numeric(df["miles"], errors="coerce").fillna(0.0)
+    df["rate"] = pd.to_numeric(df["rate"], errors="coerce").fillna(0.0)
+    df["deduction"] = (df["miles"] * df["rate"]).round(2)
+    return df
+
+
+def save_book_edits(table, edited, fields):
+    """Apply inline edits / deletes from a books data_editor. Returns (updated, deleted)."""
+    upd = dele = 0
+    with db() as c:
+        for _, r in edited.iterrows():
+            rid = int(r["id"])
+            if r["Delete"]:
+                c.execute(f"DELETE FROM {table} WHERE id=?", (rid,))
+                dele += 1
+                continue
+            vals = [fields[k](r) for k in fields]
+            c.execute(f"UPDATE {table} SET {', '.join(k + '=?' for k in fields)} WHERE id=?", [*vals, rid])
+            upd += 1
+    return upd, dele
+
+
+def _dsel(df, s, e):
+    return df[_mask(df["date"], s, e)] if len(df) else df
+
+
+def pnl(rf, exp, mil, s, e, basis="cash"):
+    """Profit and loss for [s, e]. basis 'cash' = payments received; 'accrual' = files delivered."""
+    if basis == "cash":
+        rev_rows = rf[_mask(rf["paid"], s, e)]
+        revenue = float(rev_rows["paid_amount"].sum())
+    else:
+        rev_rows = rf[_mask(rf["delivered"], s, e)]
+        revenue = float(rev_rows["fee"].sum())
+    ex = _dsel(exp, s, e)
+    mi = _dsel(mil, s, e)
+    by_cat = ex.groupby("category")["amount"].sum().sort_values(ascending=False) if len(ex) else pd.Series(dtype=float)
+    expenses = float(ex["amount"].sum()) if len(ex) else 0.0
+    mileage = float(mi["deduction"].sum()) if len(mi) else 0.0
+    net = revenue - expenses - mileage
+    return {"revenue": revenue, "expenses": expenses, "mileage": mileage, "miles": float(mi["miles"].sum()) if len(mi) else 0.0,
+            "net": net, "margin": (net / revenue) if revenue else None, "by_category": by_cat, "files": len(rev_rows)}
+
+
+def monthly_pnl(rf, exp, mil, s, e, basis="cash"):
+    if s.year < 1990:
+        ds = [d for col in ("created", "delivered", "paid") for d in rf[col] if d] + list(exp["date"].dropna()) + list(mil["date"].dropna())
+        s = min(ds) if ds else e
+    s = max(s, add_years(e, -2))
+    months = month_range(s, e)
+    rev, cost = dict.fromkeys(months, 0.0), dict.fromkeys(months, 0.0)
+    for r in rf.itertuples():
+        d, amt = (r.paid, r.paid_amount) if basis == "cash" else (r.delivered, r.fee)
+        if _in(d, s, e):
+            rev[d.strftime("%Y-%m")] += amt
+    for r in exp.itertuples():
+        if _in(r.date, s, e):
+            cost[r.date.strftime("%Y-%m")] += r.amount
+    for r in mil.itertuples():
+        if _in(r.date, s, e):
+            cost[r.date.strftime("%Y-%m")] += r.deduction
+    out = pd.DataFrame({"Revenue": list(rev.values()), "Costs": list(cost.values())}, index=months)
+    out["Net"] = out["Revenue"] - out["Costs"]
+    return out
+
+
+def service_profitability(rf, exp, mil, s, e):
+    """Per delivered file: fee less costs linked to that file; $/hour where hours were logged."""
+    sel = rf[_mask(rf["delivered"], s, e)]
+    rows = []
+    for r in sel.itertuples():
+        direct = float(exp.loc[exp["lead_id"] == r.id, "amount"].sum()) + float(mil.loc[mil["lead_id"] == r.id, "deduction"].sum())
+        rows.append({"service": r.service, "fee": r.fee, "direct": direct, "hours": r.hours})
+    d = pd.DataFrame(rows, columns=["service", "fee", "direct", "hours"])
+    out = []
+    for svc, grp in d.groupby("service"):
+        h = grp[grp["hours"] > 0]
+        out.append({"Service": svc, "Files": len(grp), "Revenue": grp["fee"].sum(), "Direct costs": grp["direct"].sum(),
+                    "Net": (grp["fee"] - grp["direct"]).sum(), "Files with hours": len(h),
+                    "Revenue / hour": (h["fee"].sum() / h["hours"].sum()) if len(h) else None,
+                    "Net / hour": ((h["fee"] - h["direct"]).sum() / h["hours"].sum()) if len(h) else None})
+    cols = ["Service", "Files", "Revenue", "Direct costs", "Net", "Files with hours", "Revenue / hour", "Net / hour"]
+    return pd.DataFrame(out, columns=cols).sort_values("Net", ascending=False).reset_index(drop=True)
+
+
+def pnl_markdown(p, label, basis):
+    cats = "\n".join(f"* {k}: {_money(v)}" for k, v in p["by_category"].items()) or "* (none)"
+    margin = "" if p["margin"] is None else f" ({p['margin'] * 100:.0f}% margin)"
+    basis_txt = "cash basis: payments received" if basis == "cash" else "accrual basis: files delivered"
+    return (f"## Profit & loss — {label} ({basis_txt})\n"
+            f"* Revenue: **{_money(p['revenue'])}** ({p['files']} file(s))\n"
+            f"* Expenses: {_money(p['expenses'])}\n"
+            f"* Mileage deduction: {_money(p['mileage'])} ({p['miles']:,.1f} miles)\n"
+            f"* **Net: {_money(p['net'])}**{margin}\n\n"
+            f"Expenses by category:\n{cats}\n\n_Figures are bookkeeping summaries, not tax advice._\n")
+
+
+
 # ==== UI ====
 # ======================================================================
 PAGE_PIPELINE = "📊 Pipeline"
@@ -1505,7 +1676,8 @@ PAGE_NEW = "➕ New Lead"
 PAGE_WORKFILE = "📋 Workfile"
 PAGE_REPORTS = "📈 Reports"
 PAGE_FEES = "💵 Fee Schedule"
-PAGES = [PAGE_PIPELINE, PAGE_NEW, PAGE_WORKFILE, PAGE_REPORTS, PAGE_FEES]
+PAGE_BOOKS = "🧾 Expenses & Mileage"
+PAGES = [PAGE_PIPELINE, PAGE_NEW, PAGE_WORKFILE, PAGE_REPORTS, PAGE_BOOKS, PAGE_FEES]
 
 CSS = """
 <style>
@@ -2058,11 +2230,13 @@ def page_workfile():
                 deadline = st.date_input("Target delivery date", value=parse_iso(lead["deadline"]) or date.today())
             source = st.selectbox("Lead source", SOURCES,
                                   index=SOURCES.index(lead["source"]) if lead.get("source") in SOURCES else 0)
-            p1, p2 = st.columns(2)
+            p1, p2, p3 = st.columns(3)
             paid_on = p1.date_input("Payment received on (leave blank if unpaid)", value=parse_iso(lead.get("paid_date")),
                                     format="MM/DD/YYYY")
             paid_amt = p2.number_input("Amount received ($) — 0 uses the quoted fee", min_value=0,
                                        value=int(lead.get("paid_amount") or 0), step=25)
+            hours = p3.number_input("Hours spent on this file", min_value=0.0, value=float(lead.get("hours") or 0),
+                                    step=0.5, format="%.1f", help="Optional. Powers revenue-per-hour in Reports → Profit & Loss.")
             notes = st.text_area("Property notes & unique traits (manual appraiser entry)", value=lead["notes"] or "",
                                  height=120, help="Physical defects, unpermitted additions, custom features, access instructions.")
             saved = st.form_submit_button("💾 Save overview", type="primary")
@@ -2070,7 +2244,7 @@ def page_workfile():
             update_lead(lid, log="File details updated", client_name=name.strip(), phone=phone.strip(),
                         email=email.strip(), assignment_type=service, fee=int(fee), street=street.strip(),
                         city=city.strip(), zip=zip_.strip(), county=county, deadline=deadline.isoformat(),
-                        source=source, notes=notes.strip(), paid_date=paid_on.isoformat() if paid_on else None,
+                        source=source, notes=notes.strip(), hours=float(hours), paid_date=paid_on.isoformat() if paid_on else None,
                         paid_amount=((int(paid_amt) or int(fee)) if paid_on else None))
             if status != lead["status"]:
                 ok, msg = change_status(lid, status)
@@ -2312,7 +2486,7 @@ def page_reports():
     pc2.caption(f"Showing {fmt_d(s) if s.year > 1990 else 'all records'} → {fmt_d(e)}. “Earned” counts files by the date "
                 "they were delivered; “Collected” counts payments by the date received.")
 
-    t_biz, t_ar, t_comp, t_exp = st.tabs(["📊 Business", "💵 Receivables", "🛡️ Compliance & Records", "📤 Export"])
+    t_biz, t_ar, t_pnl, t_comp, t_exp = st.tabs(["📊 Business", "💵 Receivables", "💼 Profit & Loss", "🛡️ Compliance & Records", "📤 Export"])
 
     # ---------------- Business ----------------
     with t_biz:
@@ -2401,6 +2575,47 @@ def page_reports():
                 st.rerun()
             st.caption("Different amount or a partial payment? Enter it on the file's Overview tab (Payment received).")
 
+    # ---------------- Profit & loss ----------------
+    with t_pnl:
+        basis_lbl = st.radio("Revenue basis", ["Cash — payments received", "Accrual — files delivered"],
+                             horizontal=True, key="pnl_basis")
+        basis = "cash" if basis_lbl.startswith("Cash") else "accrual"
+        exp, mil = load_expenses(), load_mileage()
+        p = pnl(rf, exp, mil, s, e, basis)
+        pm = st.columns(4)
+        pm[0].metric("Revenue", _money(p["revenue"]), help=f"{p['files']} file(s) in the period.")
+        pm[1].metric("Expenses", _money(p["expenses"]))
+        pm[2].metric("Mileage deduction", _money(p["mileage"]), help=f"{p['miles']:,.1f} miles.")
+        pm[3].metric("Net profit", _money(p["net"]), delta=None if p["margin"] is None else f"{p['margin'] * 100:.0f}% margin")
+        if not len(exp) and not len(mil):
+            st.info("No expenses or mileage logged yet — add them on the 🧾 Expenses & Mileage page and this becomes "
+                    "a real profit-and-loss view.")
+        trend = monthly_pnl(rf, exp, mil, s, e, basis)
+        if trend[["Revenue", "Costs"]].sum().sum() > 0:
+            st.markdown("**Revenue vs. costs by month**")
+            st.bar_chart(trend[["Revenue", "Costs"]], stack=False)
+        if len(p["by_category"]):
+            st.markdown("**Expenses by category**")
+            bc = p["by_category"].reset_index()
+            bc.columns = ["Category", "Total"]
+            st.dataframe(bc, hide_index=True, column_config={"Total": st.column_config.NumberColumn(format="$%.2f")})
+        st.markdown("**Profitability by service** (delivered files in the period)")
+        sp = service_profitability(rf, exp, mil, s, e)
+        if sp.empty:
+            st.caption("No delivered files in this period.")
+        else:
+            st.dataframe(sp, hide_index=True, column_config={
+                "Revenue": st.column_config.NumberColumn(format="$%d"),
+                "Direct costs": st.column_config.NumberColumn(format="$%.2f"),
+                "Net": st.column_config.NumberColumn(format="$%.2f"),
+                "Revenue / hour": st.column_config.NumberColumn(format="$%.0f"),
+                "Net / hour": st.column_config.NumberColumn(format="$%.0f")})
+            st.caption("Direct costs are expenses and mileage you linked to that file. Enter hours spent on each file's "
+                       "Overview tab to see revenue and net per hour — the quickest way to learn which assignment types "
+                       "actually pay. General overhead (insurance, dues, MLS) is not allocated to files.")
+        st.caption("Bookkeeping summary, not tax advice. Cash basis counts payments when received; accrual counts files "
+                   "when delivered — your accountant can tell you which your books should use.")
+
     # ---------------- Compliance & records ----------------
     with t_comp:
         st.markdown("#### Interest and prior-services disclosures")
@@ -2455,10 +2670,180 @@ def page_reports():
                            file_name=f"files_and_payments_{slug_label}.csv", mime="text/csv")
         c2.download_button("📈 Monthly summary (.csv)", monthly_trend(rf, s, e).to_csv(index_label="Month"),
                            file_name=f"monthly_summary_{slug_label}.csv", mime="text/csv")
-        c3.download_button("📄 Business report (.md)", report_markdown(rf, s, e, label, today),
+        _exp, _mil = load_expenses(), load_mileage()
+        c3.download_button("📄 Business report + P&L (.md)", report_markdown(rf, s, e, label, today, _exp, _mil),
                            file_name=f"business_report_{slug_label}.md", mime="text/markdown")
+        _ex, _mi = _dsel(_exp, s, e), _dsel(_mil, s, e)
+        d1, d2 = st.columns(2)
+        d1.download_button("🧾 Expenses (.csv)", expenses_export(_ex).to_csv(index=False),
+                           file_name=f"expenses_{slug_label}.csv", mime="text/csv")
+        d2.download_button("🚗 Mileage log (.csv)", mileage_export(_mi).to_csv(index=False),
+                           file_name=f"mileage_log_{slug_label}.csv", mime="text/csv")
         st.caption("Revenue is shown by delivery date and by payment date. Which one your books use depends on your "
                    "accounting method — ask your accountant.")
+
+
+# ----------------------------------------------------------------------
+# EXPENSES & MILEAGE PAGE
+# ----------------------------------------------------------------------
+def expenses_export(exp):
+    return pd.DataFrame({
+        "Date": [fmt_d(x) for x in exp["date"]], "Category": exp["category"], "Vendor": exp["vendor"],
+        "Description": exp["description"], "Amount": exp["amount"],
+        "File #": exp["lead_id"].astype("Int64"), "Receipt on file": ["Yes" if r else "No" for r in exp["receipt"]]})
+
+
+def mileage_export(mil):
+    return pd.DataFrame({
+        "Date": [fmt_d(x) for x in mil["date"]], "Miles": mil["miles"], "Rate ($/mi)": mil["rate"],
+        "Deduction ($)": mil["deduction"], "Origin": mil["origin"], "Destination": mil["destination"],
+        "Business purpose": mil["purpose"], "File #": mil["lead_id"].astype("Int64")})
+
+
+def _year_mask(df, yr):
+    """Boolean mask for rows dated in `yr` (safe on an empty table)."""
+    return pd.Series([d is not None and d.year == yr for d in df["date"]], index=df.index, dtype=bool)
+
+
+def page_books():
+    st.title("🧾 Expenses & Mileage")
+    st.caption("Log business costs and drives here and they flow into Reports → Profit & Loss. "
+               "Link a cost to a file to see what each assignment really nets.")
+    leads = list_leads()
+    leads = leads.sort_values("id", ascending=False) if len(leads) else leads
+    labels = {0: "— none —"}
+    for r in leads.itertuples():
+        labels[int(r.id)] = f"#{r.id} · {r.client_name} · {r.street}"
+    file_ids = list(labels)
+    t_exp, t_mil = st.tabs(["🧾 Expenses", "🚗 Mileage log"])
+    CC = st.column_config
+
+    # ---------------- Expenses ----------------
+    with t_exp:
+        with st.form("exp_form", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            d = c1.date_input("Date", value=date.today(), format="MM/DD/YYYY")
+            cat = c2.selectbox("Category", EXPENSE_CATEGORIES)
+            amt = c3.number_input("Amount ($)", min_value=0.0, value=0.0, step=5.0, format="%.2f")
+            c4, c5 = st.columns(2)
+            vendor = c4.text_input("Vendor")
+            desc = c5.text_input("Description")
+            c6, c7, c8 = st.columns(3)
+            fid = c6.selectbox("Link to a file (optional)", file_ids, format_func=lambda i: labels[i])
+            repeat = c7.number_input("Repeat monthly for … months (1 = once)", min_value=1, max_value=24, value=1,
+                                     help="For subscriptions and dues: creates one entry per month.")
+            receipt = c8.checkbox("Receipt on file")
+            ok = st.form_submit_button("➕ Add expense", type="primary")
+        if ok:
+            if amt <= 0:
+                st.error("Enter an amount greater than zero.")
+            else:
+                for i in range(int(repeat)):
+                    add_expense(add_months(d, i), cat, vendor.strip(), desc.strip(), amt, fid or None, receipt)
+                flash("success", f"Added {int(repeat)} expense entr{'y' if repeat == 1 else 'ies'} ({_money(amt)} each).")
+                st.rerun()
+
+        exp = load_expenses()
+        years = sorted({x.year for x in exp["date"] if x} | {date.today().year}, reverse=True)
+        yr = st.selectbox("Year", years, key="exp_year")
+        sub = exp[_year_mask(exp, yr)]
+        m = st.columns(3)
+        m[0].metric(f"Total {yr}", _money(float(sub["amount"].sum())))
+        m[1].metric("Entries", len(sub))
+        m[2].metric("Missing receipts", int((~sub["receipt"]).sum()) if len(sub) else 0)
+        if sub.empty:
+            st.info(f"No expenses logged for {yr} yet.")
+        else:
+            view = pd.DataFrame({
+                "id": sub["id"].values, "Date": pd.to_datetime(sub["date"]).values, "Category": sub["category"].values,
+                "Vendor": sub["vendor"].fillna("").values, "Description": sub["description"].fillna("").values,
+                "Amount": sub["amount"].values, "File #": sub["lead_id"].astype("Int64").values,
+                "Receipt": sub["receipt"].values, "Delete": False})
+            edited = st.data_editor(
+                view, hide_index=True, key=f"exp_ed_{yr}", disabled=["id", "File #"],
+                column_config={"id": None, "Date": CC.DateColumn("Date", format="MM/DD/YYYY"),
+                               "Category": CC.SelectboxColumn("Category", options=EXPENSE_CATEGORIES),
+                               "Amount": CC.NumberColumn("Amount", format="$%.2f", min_value=0.0),
+                               "Receipt": CC.CheckboxColumn("Receipt ✓"), "Delete": CC.CheckboxColumn("Delete")})
+            if st.button("💾 Save changes (edits and deletes)", key="exp_save"):
+                upd, dele = save_book_edits("expenses", edited, {
+                    "date": lambda r: (to_date(r["Date"]) or date.today()).isoformat(),
+                    "category": lambda r: r["Category"], "vendor": lambda r: r["Vendor"] or "",
+                    "description": lambda r: r["Description"] or "",
+                    "amount": lambda r: round(float(r["Amount"] or 0), 2), "receipt": lambda r: int(bool(r["Receipt"]))})
+                flash("success", f"Saved. {dele} deleted.")
+                st.rerun()
+            cat_tbl = sub.groupby("category")["amount"].sum().sort_values(ascending=False).reset_index()
+            cat_tbl.columns = ["Category", "Total"]
+            st.markdown(f"**{yr} by category**")
+            st.dataframe(cat_tbl, hide_index=True, column_config={"Total": CC.NumberColumn(format="$%.2f")})
+        st.caption("Bookkeeping record only — ask your accountant what is deductible and how.")
+
+    # ---------------- Mileage ----------------
+    with t_mil:
+        base_rate = default_mileage_rate(date.today())
+        st.caption(f"Default rate: {base_rate * 100:.1f}¢/mile — the IRS standard business mileage rate for "
+                   f"{date.today().year}. Each trip keeps the rate it was logged with. Confirm with your accountant "
+                   "whether standard mileage or actual vehicle expenses is right for you.")
+        with st.form("mil_form", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            md_ = c1.date_input("Date", value=date.today(), format="MM/DD/YYYY", key="mil_date")
+            miles = c2.number_input("Miles (one way)", min_value=0.0, value=0.0, step=0.5, format="%.1f")
+            rt = c3.checkbox("Round trip (doubles the miles)", value=True)
+            c4, c5 = st.columns(2)
+            origin = c4.text_input("From (optional)", placeholder="Office")
+            dest = c5.text_input("To", placeholder="Leave blank to use the linked file's address")
+            c6, c7, c8 = st.columns(3)
+            purpose = c6.selectbox("Business purpose", MILEAGE_PURPOSES)
+            mfid = c7.selectbox("Link to a file", file_ids, format_func=lambda i: labels[i], key="mil_fid")
+            rate = c8.number_input("Rate ($/mile)", min_value=0.0, value=float(base_rate), step=0.005, format="%.3f")
+            mok = st.form_submit_button("➕ Log trip", type="primary")
+        if mok:
+            if miles <= 0:
+                st.error("Enter the miles driven.")
+            else:
+                total = miles * 2 if rt else miles
+                use_rate = rate if abs(rate - base_rate) > 1e-9 else default_mileage_rate(md_)
+                to_txt = dest.strip() or (full_address(get_lead(mfid)) if mfid else "")
+                add_trip(md_, total, use_rate, origin.strip(), to_txt, purpose, mfid or None)
+                flash("success", f"Logged {total:,.1f} miles — {_money(total * use_rate)} at {use_rate * 100:.1f}¢.")
+                st.rerun()
+
+        mil = load_mileage()
+        myears = sorted({x.year for x in mil["date"] if x} | {date.today().year}, reverse=True)
+        myr = st.selectbox("Year", myears, key="mil_year")
+        msub = mil[_year_mask(mil, myr)]
+        mm = st.columns(3)
+        mm[0].metric(f"Miles {myr}", f"{float(msub['miles'].sum()):,.1f}")
+        mm[1].metric("Deduction", _money(float(msub["deduction"].sum())))
+        mm[2].metric("Trips", len(msub))
+        if msub.empty:
+            st.info(f"No trips logged for {myr} yet.")
+        else:
+            mview = pd.DataFrame({
+                "id": msub["id"].values, "Date": pd.to_datetime(msub["date"]).values, "Miles": msub["miles"].values,
+                "Rate": msub["rate"].values, "Deduction": msub["deduction"].values,
+                "From": msub["origin"].fillna("").values, "To": msub["destination"].fillna("").values,
+                "Purpose": msub["purpose"].fillna("").values, "File #": msub["lead_id"].astype("Int64").values,
+                "Delete": False})
+            medited = st.data_editor(
+                mview, hide_index=True, key=f"mil_ed_{myr}", disabled=["id", "Deduction", "File #"],
+                column_config={"id": None, "Date": CC.DateColumn("Date", format="MM/DD/YYYY"),
+                               "Miles": CC.NumberColumn("Miles", format="%.1f", min_value=0.0),
+                               "Rate": CC.NumberColumn("Rate", format="$%.3f", min_value=0.0),
+                               "Deduction": CC.NumberColumn("Deduction", format="$%.2f"),
+                               "Purpose": CC.SelectboxColumn("Purpose", options=MILEAGE_PURPOSES),
+                               "Delete": CC.CheckboxColumn("Delete")})
+            if st.button("💾 Save changes (edits and deletes)", key="mil_save"):
+                upd, dele = save_book_edits("mileage", medited, {
+                    "date": lambda r: (to_date(r["Date"]) or date.today()).isoformat(),
+                    "miles": lambda r: round(float(r["Miles"] or 0), 1), "rate": lambda r: float(r["Rate"] or 0),
+                    "origin": lambda r: r["From"] or "", "destination": lambda r: r["To"] or "",
+                    "purpose": lambda r: r["Purpose"] or ""})
+                flash("success", f"Saved. {dele} deleted.")
+                st.rerun()
+        st.caption("A mileage log generally needs the date, miles, destination and business purpose for each trip "
+                   "(IRS recordkeeping) — this log captures all four. Deduction shown is miles × the rate.")
 
 
 # ----------------------------------------------------------------------
@@ -2564,6 +2949,8 @@ def main():
         page_workfile()
     elif page == PAGE_REPORTS:
         page_reports()
+    elif page == PAGE_BOOKS:
+        page_books()
     else:
         page_fees()
 
