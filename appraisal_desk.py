@@ -21,7 +21,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "v2.4.1"
+APP_VERSION = "v2.5"
 DB_PATH = os.environ.get("APPRAISAL_DB", "appraisal_desk.db")
 BACKUP_ROOT = "Appraisal_Files_Active"
 
@@ -137,6 +137,7 @@ LEAD_COLS = {
     "paid_date": "TEXT", "paid_amount": "INTEGER",
     "no_interest": "INTEGER", "no_prior_services": "INTEGER", "disclosure_notes": "TEXT",
     "hours": "REAL",
+    "facts_json": "TEXT", "report_json": "TEXT",
 }
 
 
@@ -183,9 +184,12 @@ def init_db():  # cheap and idempotent: runs on every load so code updates alway
         c.execute("""CREATE TABLE IF NOT EXISTS mileage (
             id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, miles REAL, rate REAL, origin TEXT,
             destination TEXT, purpose TEXT, lead_id INTEGER, created_at TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS narratives (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, section TEXT, title TEXT, body TEXT, created_at TEXT)""")
         if c.execute("SELECT COUNT(*) FROM fees").fetchone()[0] == 0:
             for i, (svc, fee) in enumerate(DEFAULT_FEES.items()):
                 c.execute("INSERT INTO fees (service, fee, sort) VALUES (?,?,?)", (svc, fee, i))
+    seed_narratives_once()
     return True
 
 
@@ -1794,6 +1798,776 @@ def due_label(deadline, status):
     return f"{d:%b %d} ({delta}d)"
 
 
+# ======================================================================
+# NARRATIVE LIBRARY, PROPERTY FACTS, REPORT MATERIALS
+# ======================================================================
+REPORT_SECTIONS = [
+    "Neighborhood description", "Market conditions", "Site description", "Improvements description",
+    "Condition and quality", "Functional utility", "Highest and best use", "Sales comparison methodology",
+    "Reconciliation", "Scope of work", "Extraordinary assumptions & hypothetical conditions",
+    "Limiting conditions & disclosures",
+]
+FACT_FIELDS = ["Property type", "Year built", "Stories", "Bedrooms", "Bathrooms", "Garage", "Basement", "Pool",
+               "Foundation / construction", "Parcel / account #", "Legal description", "Notable features"]
+FACT_SOURCES = ["", "MLS", "County records", "Client-provided", "Appraiser-observed", "Appraiser-verified"]
+VERIFIED_SOURCES = {"County records", "Appraiser-observed", "Appraiser-verified"}
+KEY_FACTS = ["Property type", "Year built", "Bedrooms", "Bathrooms", "Parcel / account #"]
+FACT_TOKENS = {"Property type": "PROPERTY_TYPE", "Year built": "YEAR_BUILT", "Stories": "STORIES",
+               "Bedrooms": "BEDROOMS", "Bathrooms": "BATHROOMS", "Garage": "GARAGE", "Basement": "BASEMENT",
+               "Pool": "POOL", "Foundation / construction": "CONSTRUCTION", "Parcel / account #": "PARCEL",
+               "Legal description": "LEGAL_DESCRIPTION", "Notable features": "NOTABLE_FEATURES"}
+DOC_ITEMS = ["Engagement letter", "Inspection notes / sketch", "Subject photographs", "MLS / comparable data",
+             "Market analysis support", "Public records (county)"]
+INTENDED_USE = {
+    "Date of Death / Probate": "estimating the market value of the property as of the decedent's date of death for estate administration",
+    "Divorce or Marital Property Division": "estimating market value to assist in the division of marital property",
+    "Property Tax Protest (ARB)": "supporting a property tax protest before the appraisal review board",
+    "Pre-Listing Appraisal": "informing the owner's listing-price planning",
+    "PMI / MIP Cancellation": "supporting a request to cancel mortgage insurance",
+    "Gift Tax (Form 709)": "estimating market value for federal gift tax reporting",
+    "IRS Appraisals (Gift/Estate Tax)": "estimating market value for federal gift or estate tax reporting",
+    "Trust Funding & Administration": "trust funding and administration",
+    "Bankruptcy Schedule A/B": "reporting the property on bankruptcy schedules",
+    "Expert Witness & Litigation Support": "supporting expert analysis in litigation",
+    "Pre-Purchase for Buyers": "informing a prospective buyer's purchase decision",
+}
+TOKEN_RE = re.compile(r"\[([A-Z][A-Z0-9_]{2,})\]")
+TOKEN_HELP = {
+    "CLIENT": "Client name", "PROPERTY_ADDRESS": "Street address", "CITY": "City", "COUNTY": "County (name only)",
+    "ZIP": "ZIP code", "SERVICE": "Assignment type", "INTENDED_USE": "Intended use (filled from the service type — confirm)",
+    "EFFECTIVE_DATE": "Effective date", "INSPECTION_DATE": "Inspection date", "INSPECTION_TYPE": "Inspection type",
+    "REPORT_DATE": "Today's date", "APPRAISER": "Appraiser name", "FIRM": "Firm name", "LICENSE": "Appraiser license #",
+    "GLA": "Gross living area (measured, else county)", "COUNTY_GLA": "County-record GLA", "LOT_SIZE": "Site size",
+    "ASSESSED_VALUE": "Assessed value", "RECORDS_SOURCE": "Public-records source", "CONDITION_RATING": "C1–C6",
+    "QUALITY_RATING": "Q1–Q6", "TIME_BASIS": "Time-adjustment basis", "COMP_COUNT": "Number of comps used",
+    "SALE_RANGE": "Comp sale-price range", "ADJ_RANGE": "Adjusted-price range", "DISCLOSURE_STATEMENT": "Disclosure note",
+    **{v: f"Property facts → {k}" for k, v in FACT_TOKENS.items()},
+}
+
+NARRATIVE_SEEDS = [
+    ("Neighborhood description", "Sample — Established neighborhood",
+     "The subject is located in [NEIGHBORHOOD], an established residential area of [CITY], [COUNTY] County, Texas. Land use in the "
+     "immediate area is predominantly single-family residential, with schools, retail and services nearby. Access to major "
+     "roadways is [ACCESS_DESCRIPTION]. No adverse influences were noted beyond those typical of the area, other than "
+     "[ADVERSE_INFLUENCES]."),
+    ("Neighborhood description", "Sample — Newer subdivision",
+     "The subject is located in [SUBDIVISION], a newer subdivision in [CITY], [COUNTY] County. Homes in the subdivision were built "
+     "primarily between [BUILD_YEARS] on lots that are typically [TYPICAL_LOT_DESCRIPTION]. The subdivision is served by "
+     "[SCHOOL_DISTRICT]."),
+    ("Market conditions", "Sample — Current market",
+     "Market conditions in [CITY] and the surrounding area as of [EFFECTIVE_DATE] were reviewed using MLS data and public records. "
+     "[MARKET_TREND] Typical marketing time was approximately [TYPICAL_DOM] days, and typical sale-to-list price ratios were "
+     "[SALE_TO_LIST]. Supporting data is retained in the workfile."),
+    ("Market conditions", "Sample — Retrospective effective date",
+     "Market conditions were analyzed as of the retrospective effective date of [EFFECTIVE_DATE]. [RETROSPECTIVE_DATA_NOTE] "
+     "[MARKET_TREND]"),
+    ("Site description", "Sample — Residential site",
+     "The site contains approximately [LOT_SIZE] and is [SITE_SHAPE_TOPOGRAPHY]. Public utilities available include [UTILITIES]. "
+     "County records identify the property as parcel [PARCEL]. Easements and encroachments: [EASEMENTS_ENCROACHMENTS]."),
+    ("Improvements description", "Sample — Single-family detached",
+     "The subject is a [STORIES]-story [PROPERTY_TYPE] built in [YEAR_BUILT] with [GLA] of gross living area, [BEDROOMS] bedrooms "
+     "and [BATHROOMS] bathrooms. Garage: [GARAGE]. Construction: [CONSTRUCTION]. Notable features include [NOTABLE_FEATURES]."),
+    ("Improvements description", "Sample — Measured vs. county GLA",
+     "Gross living area was measured by the appraiser in accordance with ANSI Z765 and totals [GLA]. County records report "
+     "[COUNTY_GLA]. The appraiser's measurement was used in this analysis."),
+    ("Condition and quality", "Sample — Condition",
+     "As of the inspection on [INSPECTION_DATE], the improvements were observed to be in [CONDITION_RATING] condition overall. "
+     "Renovations and updates: [RENOVATIONS_UPDATES]. Deferred maintenance observed: [DEFERRED_MAINTENANCE]."),
+    ("Condition and quality", "Sample — Quality",
+     "The quality of construction is rated [QUALITY_RATING], based on [QUALITY_BASIS]."),
+    ("Functional utility", "Sample — Layout",
+     "The floor plan is [LAYOUT_DESCRIPTION] and is considered [FUNCTIONAL_OPINION] for the market area. Functional issues "
+     "observed: [FUNCTIONAL_ISSUES]."),
+    ("Highest and best use", "Sample — As vacant and as improved",
+     "Highest and best use as vacant: [HBU_AS_VACANT]. Highest and best use as improved: [HBU_AS_IMPROVED]. The legally "
+     "permissible, physically possible, financially feasible and maximally productive tests were considered; the analysis is "
+     "retained in the workfile."),
+    ("Sales comparison methodology", "Sample — Sales comparison approach",
+     "The sales comparison approach was applied using [COMP_COUNT] comparable sales with unadjusted prices from [SALE_RANGE]. "
+     "After adjustment, the comparables indicated [ADJ_RANGE]. Adjustments were developed using [ADJUSTMENT_SUPPORT_METHOD]. "
+     "Time adjustments follow the [TIME_BASIS] basis."),
+    ("Sales comparison methodology", "Sample — Cost and income approaches",
+     "The cost approach and the income approach were [CONSIDERED_OR_NOT_DEVELOPED] because [COST_INCOME_REASON]."),
+    ("Reconciliation", "Sample — Reconciliation",
+     "The indications from the comparable sales were reconciled with the most weight placed on [MOST_WEIGHT_COMPARABLES] "
+     "because [RECONCILIATION_REASONING]."),
+    ("Scope of work", "Sample — Scope of work",
+     "The scope of work for this [SERVICE] assignment for [CLIENT] included an inspection of the subject property ([INSPECTION_TYPE]) "
+     "on [INSPECTION_DATE], research of public records from [RECORDS_SOURCE], verification of comparable sales data from "
+     "[DATA_SOURCES], and analysis using the sales comparison approach. The intended use is [INTENDED_USE]. The effective date is "
+     "[EFFECTIVE_DATE] and the report date is [REPORT_DATE]."),
+    ("Extraordinary assumptions & hypothetical conditions", "Sample — None",
+     "No extraordinary assumptions or hypothetical conditions were used in this assignment."),
+    ("Extraordinary assumptions & hypothetical conditions", "Sample — Extraordinary assumption",
+     "This analysis relies on the extraordinary assumption that [EXTRAORDINARY_ASSUMPTION]. If this assumption is found to be "
+     "false, the results of the analysis could be affected."),
+    ("Extraordinary assumptions & hypothetical conditions", "Sample — Hypothetical condition",
+     "This analysis is based on the hypothetical condition that [HYPOTHETICAL_CONDITION], which is contrary to what exists as of "
+     "the effective date. Use of this hypothetical condition may affect the assignment results."),
+    ("Limiting conditions & disclosures", "Sample — Use and reliance",
+     "This report was prepared for [CLIENT] for the intended use of [INTENDED_USE] and may not be relied upon by others or for "
+     "other purposes. [ADDITIONAL_LIMITING_CONDITIONS]"),
+    ("Limiting conditions & disclosures", "Sample — Prior services and interest",
+     "Disclosure regarding interest in the property and prior services: [DISCLOSURE_STATEMENT]"),
+]
+
+
+# ---------- narrative library (data layer) ----------
+def seed_narratives_once():
+    if get_setting("narratives_seeded"):
+        return
+    with db() as c:
+        if c.execute("SELECT COUNT(*) FROM narratives").fetchone()[0] == 0:
+            for sec, title, body in NARRATIVE_SEEDS:
+                c.execute("INSERT INTO narratives (section, title, body, created_at) VALUES (?,?,?,?)",
+                          (sec, title, body, now_str()))
+    set_setting("narratives_seeded", True)
+
+
+def list_narratives(section=None):
+    q, args = "SELECT id, section, title, body FROM narratives", []
+    if section:
+        q += " WHERE section=?"
+        args.append(section)
+    with db() as c:
+        rows = c.execute(q + " ORDER BY section, title COLLATE NOCASE", args).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_narrative(section, title, body):
+    with db() as c:
+        return c.execute("INSERT INTO narratives (section, title, body, created_at) VALUES (?,?,?,?)",
+                         (section, title.strip() or "Untitled", body.strip(), now_str())).lastrowid
+
+
+def update_narrative(nid, title, body):
+    with db() as c:
+        c.execute("UPDATE narratives SET title=?, body=? WHERE id=?", (title.strip() or "Untitled", body.strip(), nid))
+
+
+def delete_narrative(nid):
+    with db() as c:
+        c.execute("DELETE FROM narratives WHERE id=?", (nid,))
+
+
+def export_narratives_json():
+    return json.dumps([{k: r[k] for k in ("section", "title", "body")} for r in list_narratives()], indent=1)
+
+
+def import_narratives_json(text):
+    """Merge a library export; entries with the same section + title are skipped. Returns (added, skipped)."""
+    recs = json.loads(text)
+    have = {(r["section"], r["title"]) for r in list_narratives()}
+    added = skipped = 0
+    for r in recs:
+        if not isinstance(r, dict) or r.get("section") not in REPORT_SECTIONS or not str(r.get("body", "")).strip():
+            skipped += 1
+            continue
+        if (r["section"], r.get("title", "")) in have:
+            skipped += 1
+            continue
+        add_narrative(r["section"], r.get("title", "Imported"), r["body"])
+        added += 1
+    return added, skipped
+
+
+# ---------- property facts (each with a source label) ----------
+def load_facts(lead):
+    try:
+        raw = json.loads(lead.get("facts_json") or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    return {f: {"v": str((raw.get(f) or {}).get("v", "") or ""), "src": (raw.get(f) or {}).get("src", "") or ""}
+            for f in FACT_FIELDS}
+
+
+def facts_frame(lead):
+    f = load_facts(lead)
+    return pd.DataFrame({"Field": FACT_FIELDS, "Value": [f[k]["v"] for k in FACT_FIELDS],
+                         "Source": [f[k]["src"] or None for k in FACT_FIELDS]})
+
+
+def facts_to_json(df):
+    out = {}
+    for r in df.to_dict("records"):
+        v = "" if _isblank(r.get("Value")) else str(r["Value"]).strip()
+        s = "" if _isblank(r.get("Source")) else str(r["Source"])
+        out[r["Field"]] = {"v": v, "src": s}
+    return json.dumps(out)
+
+
+def load_report(lead):
+    try:
+        r = json.loads(lead.get("report_json") or "{}")
+    except json.JSONDecodeError:
+        r = {}
+    return r if isinstance(r, dict) else {}
+
+
+# ---------- placeholders ----------
+def _long_date(d):
+    return f"{d:%B} {d.day}, {d.year}" if d else None
+
+
+def _money0(v):
+    return f"${v:,.0f}"
+
+
+def report_context(lead, facts, calc, today):
+    """token -> text for everything we already know. Unknown tokens stay in the text for the appraiser to finish."""
+    used = used_comps(calc) if len(calc) else calc
+    ctx = {
+        "CLIENT": lead.get("client_name"), "PROPERTY_ADDRESS": lead.get("street"), "CITY": lead.get("city"),
+        "COUNTY": lead.get("county"), "ZIP": lead.get("zip"), "SERVICE": lead.get("assignment_type"),
+        "INTENDED_USE": INTENDED_USE.get(lead.get("assignment_type") or ""),
+        "EFFECTIVE_DATE": _long_date(parse_iso(lead.get("effective_date"))),
+        "INSPECTION_DATE": _long_date(parse_iso(lead.get("inspection_date"))),
+        "INSPECTION_TYPE": (lead.get("inspection_type") or "").lower() or None,
+        "REPORT_DATE": _long_date(today), "APPRAISER": APPRAISER["name"], "FIRM": APPRAISER["firm"],
+        "LICENSE": f"TX {APPRAISER['license']}", "LOT_SIZE": lead.get("lot_size"),
+        "ASSESSED_VALUE": lead.get("assessed_value"), "RECORDS_SOURCE": lead.get("records_source"),
+        "CONDITION_RATING": rating_code(lead.get("condition_rating"), "C"),
+        "QUALITY_RATING": rating_code(lead.get("quality_rating"), "Q"), "TIME_BASIS": lead.get("time_basis"),
+        "DISCLOSURE_STATEMENT": (lead.get("disclosure_notes") or "").strip() or None,
+    }
+    gla = int(lead.get("ansi_gla") or 0) or int(lead.get("tad_gla") or 0)
+    if gla:
+        ctx["GLA"] = f"{gla:,} square feet"
+    if int(lead.get("tad_gla") or 0):
+        ctx["COUNTY_GLA"] = f"{int(lead['tad_gla']):,} square feet"
+    for f, tok in FACT_TOKENS.items():
+        if facts.get(f, {}).get("v"):
+            ctx[tok] = facts[f]["v"]
+    if len(used):
+        ctx["COMP_COUNT"] = str(len(used))
+        ctx["SALE_RANGE"] = f"{_money0(used['Sale Price'].min())} to {_money0(used['Sale Price'].max())}"
+        ctx["ADJ_RANGE"] = f"{_money0(used['Adjusted Price'].min())} to {_money0(used['Adjusted Price'].max())}"
+    return {k: str(v) for k, v in ctx.items() if v not in (None, "")}
+
+
+def fill_placeholders(text, ctx):
+    """Fill known [TOKENS]. Returns (filled text, list of tokens still open, in order of appearance)."""
+    def sub(m):
+        return ctx.get(m.group(1), m.group(0))
+    out = TOKEN_RE.sub(sub, text or "")
+    left = []
+    for m in TOKEN_RE.finditer(out):
+        if m.group(1) not in left:
+            left.append(m.group(1))
+    return out, left
+
+
+# ---------- completeness & consistency checker ----------
+SEV_ORDER = {"fix": 0, "missing": 1, "review": 2}
+SEV_LABEL = {"fix": "🔴 Needs fixing", "missing": "🟡 Missing", "review": "🔵 Needs your professional review"}
+
+
+def report_checks(lead, calc, facts, report, today):
+    """[{sev: fix|missing|review, area, msg}] plus a count of passed checks."""
+    out, passed = [], 0
+
+    def issue(sev, area, msg):
+        out.append({"sev": sev, "area": area, "msg": msg})
+
+    def ok():
+        nonlocal passed
+        passed += 1
+
+    # Subject data
+    miss = [f for f in KEY_FACTS if not facts[f]["v"]]
+    if miss:
+        issue("missing", "Subject data", "Property facts not entered: " + ", ".join(miss) + ".")
+    else:
+        ok()
+    unver = [f for f in FACT_FIELDS if facts[f]["v"] and facts[f]["src"] not in VERIFIED_SOURCES]
+    if unver:
+        issue("review", "Subject data", "Not yet verified (source is MLS, client-provided or unlabeled): " + ", ".join(unver) + ".")
+    else:
+        ok()
+    tad, ansi = int(lead.get("tad_gla") or 0), int(lead.get("ansi_gla") or 0)
+    if not (tad or ansi):
+        issue("missing", "Subject data", "No gross living area entered (county or measured).")
+    elif tad and ansi and abs(ansi - tad) / tad > 0.05:
+        issue("review", "Subject data", f"Measured GLA differs from county records by {ansi - tad:+,} SF ({(ansi - tad) / tad * 100:+.1f}%).")
+    else:
+        ok()
+    # Dates
+    eff, insp = parse_iso(lead.get("effective_date")), parse_iso(lead.get("inspection_date"))
+    if not eff:
+        issue("missing", "Dates", "Effective date is not set.")
+    else:
+        ok()
+    if not insp and (lead.get("inspection_type") or "") != "Desktop":
+        issue("missing", "Dates", "Inspection date is not set.")
+    elif insp and insp > today:
+        issue("fix", "Dates", f"Inspection date {fmt_d(insp)} is in the future.")
+    else:
+        ok()
+    if eff and eff > today:
+        issue("review", "Dates", f"Effective date {fmt_d(eff)} is after today — confirm this is a prospective appraisal.")
+    # Comparables
+    used = used_comps(calc) if len(calc) else calc
+    if not len(calc):
+        issue("missing", "Comparables", "No comparables entered.")
+    else:
+        bad = [r["Address"] or f"row {i + 1}" for i, r in calc.iterrows()
+               if r["Sale Price"] <= 0 or not r["Sale Date"] or not r["MLS #"]]
+        if bad:
+            issue("missing", "Comparables", "Missing price, sale date or MLS # on: " + "; ".join(bad) + ".")
+        else:
+            ok()
+        if not len(used):
+            issue("missing", "Comparables", "No comparable carries Most or Less weight.")
+        flagged = [f"{r['Address']} ({r['Flags']})" for _, r in calc.iterrows() if r["Flags"]]
+        if flagged:
+            issue("review", "Adjustments", "Large adjustments — document support: " + "; ".join(flagged) + ".")
+        else:
+            ok()
+        drift = [r["Address"] for _, r in calc.iterrows()
+                 if abs(r["Adjusted Price"] - (r["Sale Price"] + r[ADJ_COLS].sum())) > 0.5]
+        if drift:
+            issue("fix", "Adjustments", "Arithmetic does not reconcile on: " + "; ".join(drift) + ".")
+        else:
+            ok()
+    ov = int(lead.get("opinion_value") or 0)
+    if len(used) and ov:
+        lo, hi = used["Adjusted Price"].min(), used["Adjusted Price"].max()
+        if ov < lo or ov > hi:
+            issue("fix", "Reconciliation",
+                  f"Opinion of value {_money0(ov)} is outside the adjusted range of the comps used ({_money0(lo)}–{_money0(hi)}).")
+        else:
+            ok()
+    # Reconciliation
+    if not (lead.get("reconciliation_notes") or "").strip():
+        issue("missing", "Reconciliation", "No appraiser-entered reconciliation explanation.")
+    else:
+        ok()
+    if not ov:
+        issue("missing", "Reconciliation", "No opinion of value entered (this tool never supplies one).")
+    # Narratives
+    texts = {s: (report.get(s) or "").strip() for s in REPORT_SECTIONS}
+    blank = [s for s, t in texts.items() if not t]
+    if blank:
+        issue("missing", "Narratives", f"{len(blank)} section(s) blank: " + ", ".join(blank) + ".")
+    else:
+        ok()
+    ctx = report_context(lead, facts, calc, today)
+    open_toks = {}
+    for s, t in texts.items():
+        for tok in fill_placeholders(t, ctx)[1]:
+            open_toks.setdefault(s, []).append(tok)
+    if open_toks:
+        n = sum(len(v) for v in open_toks.values())
+        issue("review", "Narratives", f"{n} placeholder(s) still open in: " + ", ".join(open_toks) + ".")
+    else:
+        ok()
+    iu = INTENDED_USE.get(lead.get("assignment_type") or "")
+    if iu and any(iu in t for t in texts.values()):
+        issue("review", "Narratives", "Intended use was auto-filled from the service type — confirm it matches the engagement letter.")
+    # Consistency: narrative text vs. file data
+    gla = ansi or tad
+    year = facts["Year built"]["v"]
+    beds = facts["Bedrooms"]["v"]
+    for s, t in texts.items():
+        for m in re.finditer(r"([\d,]{3,6})\s*(?:square feet|sq\.? ?ft\.?|SF)\b", t, re.I):
+            n = int(m.group(1).replace(",", "") or 0)
+            if gla and n and n not in (ansi, tad) and abs(n - gla) > 0:
+                issue("fix", "Consistency", f"“{s}” cites {n:,} SF but the file shows {gla:,} SF"
+                      + (f" (county {tad:,})" if tad and tad != gla else "") + ".")
+        for m in re.finditer(r"built in (\d{4})", t, re.I):
+            if year and m.group(1) != year.strip():
+                issue("fix", "Consistency", f"“{s}” says built in {m.group(1)} but the facts sheet says {year}.")
+        for m in re.finditer(r"(\d+)\s*bedrooms?", t, re.I):
+            if beds and m.group(1) != beds.strip().split(".")[0]:
+                issue("fix", "Consistency", f"“{s}” says {m.group(1)} bedrooms but the facts sheet says {beds}.")
+    # Disclosures
+    disc = (bool(lead.get("no_interest")) and bool(lead.get("no_prior_services"))) or bool((lead.get("disclosure_notes") or "").strip())
+    if not disc:
+        issue("missing", "Disclosures", "Interest / prior-services disclosure not addressed (Subject & Scope tab).")
+    else:
+        ok()
+    # Workfile documents
+    docs = set(report.get("_docs") or [])
+    nodoc = [d for d in DOC_ITEMS if d not in docs]
+    if nodoc:
+        issue("missing", "Workfile", "Not marked as on file: " + ", ".join(nodoc) + ".")
+    else:
+        ok()
+    out.sort(key=lambda x: SEV_ORDER[x["sev"]])
+    return out, passed
+
+
+# ---------- Word draft ----------
+def build_report_docx(lead, calc, unused, facts, report, checks, today):
+    """Report-preparation package as .docx bytes. Open [TOKENS] and blank sections are highlighted for the appraiser."""
+    from docx import Document
+    from docx.enum.text import WD_COLOR_INDEX
+    from docx.shared import Pt, Inches
+    import io
+
+    ctx = report_context(lead, facts, calc, today)
+    doc = Document()
+    for s in doc.sections:
+        s.left_margin = s.right_margin = Inches(0.8)
+        s.top_margin = s.bottom_margin = Inches(0.8)
+    doc.styles["Normal"].font.name = "Calibri"
+    doc.styles["Normal"].font.size = Pt(10.5)
+
+    def runs(par, text, bold=False, italic=False, size=None):
+        for part in re.split(r"(\[[A-Z][A-Z0-9_]{2,}\])", text):
+            if not part:
+                continue
+            r = par.add_run(part)
+            r.bold, r.italic = bold, italic
+            if size:
+                r.font.size = Pt(size)
+            if TOKEN_RE.fullmatch(part):
+                r.font.highlight_color = WD_COLOR_INDEX.YELLOW
+
+    def todo(par, text):
+        r = par.add_run(text)
+        r.font.highlight_color = WD_COLOR_INDEX.YELLOW
+        r.bold = True
+
+    def table(header, rows, widths=None, size=8.5):
+        t = doc.add_table(rows=1, cols=len(header))
+        t.style = "Table Grid"
+        for i, h in enumerate(header):
+            c = t.rows[0].cells[i]
+            c.text = ""
+            runs(c.paragraphs[0], str(h), bold=True, size=size)
+        for row in rows:
+            cells = t.add_row().cells
+            for i, v in enumerate(row):
+                cells[i].text = ""
+                runs(cells[i].paragraphs[0], str(v), size=size)
+        if widths:
+            t.autofit = False
+            for row in t.rows:
+                for i, w in enumerate(widths):
+                    row.cells[i].width = Inches(w)
+        doc.add_paragraph()
+        return t
+
+    doc.add_heading(f"{APPRAISER['firm']} — Report Preparation Package", 0)
+    p = doc.add_paragraph()
+    runs(p, "DRAFT FOR APPRAISER COMPLETION. This is not a finished appraisal report. It contains no certification and "
+            "states no opinion of value unless the appraiser entered one. Yellow highlights mark text the appraiser must "
+            "complete or confirm.", italic=True)
+    doc.add_paragraph(f"{lead.get('client_name') or ''} · {full_address(lead)} · prepared {_long_date(today)}")
+
+    doc.add_heading("1. Assignment information", 1)
+    table(["Item", "Detail"], [
+        ["Client", lead.get("client_name") or "[CLIENT]"], ["Service", lead.get("assignment_type") or "[SERVICE]"],
+        ["Intended use", ctx.get("INTENDED_USE", "[INTENDED_USE]")],
+        ["Effective date", ctx.get("EFFECTIVE_DATE", "[EFFECTIVE_DATE]")],
+        ["Inspection", f"{lead.get('inspection_type') or '[INSPECTION_TYPE]'} · {ctx.get('INSPECTION_DATE', '[INSPECTION_DATE]')}"],
+        ["Report date", ctx["REPORT_DATE"]],
+        ["Appraiser", f"{APPRAISER['name']}, {APPRAISER['designation']} (TALCB #{APPRAISER['license']})"],
+    ], [1.6, 5.2], 9.5)
+
+    doc.add_heading("2. Subject property", 1)
+    gla_txt = ctx.get("GLA", "[GLA]")
+    table(["Item", "Detail"], [
+        ["Address", full_address(lead)], ["County", lead.get("county") or "[COUNTY]"],
+        ["Gross living area", gla_txt + (f" (county records: {ctx['COUNTY_GLA']})" if "COUNTY_GLA" in ctx and ctx["COUNTY_GLA"] != gla_txt else "")],
+        ["Site size", lead.get("lot_size") or "[LOT_SIZE]"], ["Assessed value", lead.get("assessed_value") or "[ASSESSED_VALUE]"],
+        ["Records source", lead.get("records_source") or "[RECORDS_SOURCE]"],
+        ["Condition / quality", f"{ctx.get('CONDITION_RATING', '[CONDITION_RATING]')} / {ctx.get('QUALITY_RATING', '[QUALITY_RATING]')}"],
+    ], [1.6, 5.2], 9.5)
+    rows = []
+    for f in FACT_FIELDS:
+        v, s = facts[f]["v"], facts[f]["src"]
+        status = "Verified" if s in VERIFIED_SOURCES and v else ("UNVERIFIED — confirm" if v else "Not entered")
+        rows.append([f, v or f"[{FACT_TOKENS[f]}]", s or "—", status])
+    doc.add_paragraph("Property data sheet (each fact with its source)").runs[0].bold = True
+    table(["Field", "Value", "Source", "Status"], rows, [1.7, 2.6, 1.3, 1.2])
+
+    doc.add_heading("3. Narrative sections", 1)
+    for s in REPORT_SECTIONS:
+        doc.add_heading(s, 2)
+        txt = (report.get(s) or "").strip()
+        if not txt:
+            todo(doc.add_paragraph(), "[APPRAISER TO COMPLETE — no narrative entered]")
+            continue
+        filled, _ = fill_placeholders(txt, ctx)
+        for chunk in filled.split("\n\n"):
+            runs(doc.add_paragraph(), chunk.strip())
+
+    doc.add_heading("4. Sales comparison data", 1)
+    if not len(calc):
+        todo(doc.add_paragraph(), "[APPRAISER TO COMPLETE — no comparables entered]")
+    else:
+        table(["#", "Address", "MLS #", "Status", "Sale price", "Sale date", "GLA", "Weight"],
+              [[i + 1, r["Address"], r["MLS #"], r["Status"] or "", _money0(r["Sale Price"]), fmt_d(r["Sale Date"]) if r["Sale Date"] else "—",
+                f"{r['GLA']:,.0f}" if r["GLA"] else "—", r["Weight"] or ""] for i, r in calc.iterrows()],
+              [0.3, 1.9, 0.8, 0.9, 0.9, 0.8, 0.5, 0.9])
+        doc.add_paragraph("Adjustments (entered by the appraiser; this tool only performs the arithmetic)").runs[0].bold = True
+        table(["#", "Time", "Cond/Qual", "GLA", "Site", "Other", "Net adj", "Gross %", "Adjusted price"],
+              [[i + 1] + [f"{r[c]:+,.0f}" for c in ADJ_COLS] + [f"{r['Net Adj']:+,.0f}", f"{r['Gross %']:.1f}%", _money0(r["Adjusted Price"])]
+               for i, r in calc.iterrows()], [0.3, 0.7, 0.8, 0.7, 0.7, 0.7, 0.8, 0.7, 1.1])
+        used = used_comps(calc)
+        if len(used):
+            doc.add_paragraph(f"Adjusted-price range of comparables with Most or Less weight: "
+                              f"{_money0(used['Adjusted Price'].min())} – {_money0(used['Adjusted Price'].max())}.")
+        if any(str(r["Weight Rationale"]).strip() for _, r in calc.iterrows()):
+            doc.add_paragraph("Weight rationale (appraiser's)").runs[0].bold = True
+            for i, r in calc.iterrows():
+                if str(r["Weight Rationale"]).strip():
+                    doc.add_paragraph(f"Comp {i + 1} ({r['Weight']}): {r['Weight Rationale']}", style="List Bullet")
+    if len(unused):
+        doc.add_paragraph("Analyzed but not used").runs[0].bold = True
+        table(list(UNUSED_COLS), [[r[c] for c in UNUSED_COLS] for _, r in unused.iterrows()], [1.9, 1.0, 2.0, 1.9])
+
+    doc.add_heading("5. Reconciliation", 1)
+    recon = (lead.get("reconciliation_notes") or "").strip()
+    if recon:
+        runs(doc.add_paragraph(), recon)
+    else:
+        todo(doc.add_paragraph(), "[APPRAISER TO COMPLETE — reconciliation explanation]")
+    ov = int(lead.get("opinion_value") or 0)
+    p = doc.add_paragraph()
+    p.add_run("Opinion of value (as entered by the appraiser): ").bold = True
+    if ov:
+        p.add_run(_money0(ov))
+    else:
+        todo(p, "[APPRAISER TO COMPLETE]")
+
+    doc.add_heading("6. Items to resolve before finalizing", 1)
+    if not checks:
+        doc.add_paragraph("No open items found by the completeness check.")
+    for sev in ("fix", "missing", "review"):
+        items = [c for c in checks if c["sev"] == sev]
+        if items:
+            doc.add_paragraph(SEV_LABEL[sev].split(" ", 1)[1]).runs[0].bold = True
+            for c in items:
+                doc.add_paragraph(f"{c['area']}: {c['msg']}", style="List Bullet")
+
+    doc.add_heading("7. Workfile documents", 1)
+    have = set(report.get("_docs") or [])
+    for d in DOC_ITEMS:
+        doc.add_paragraph(("☑ " if d in have else "☐ ") + d)
+    p = doc.add_paragraph()
+    runs(p, "Certification, signature and any required lender or client forms are added by the appraiser from his own templates.", italic=True)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+# ======================================================================
+# FULL DEMO DATA (fictional) -- one complete file + six months of history
+# ======================================================================
+SHOWCASE_NAME = "DEMO — Reyes Residence"
+
+
+def _ts(days_ago):
+    return (date.today() - timedelta(days=days_ago)).strftime("%Y-%m-%d") + " 10:00:00"
+
+
+def _set_history(lid, steps, paid=None, hours=None, closed=False):
+    """steps = [(status, days_ago)] oldest first; rewrites the activity log and the date columns."""
+    steps = sorted(steps, key=lambda s: -s[1])
+    first, last = steps[0][1], steps[-1][1]
+    with db() as c:
+        c.execute("DELETE FROM activity WHERE lead_id=?", (lid,))
+        c.execute("INSERT INTO activity (lead_id, ts, message) VALUES (?,?,?)", (lid, _ts(first), "Lead created (demo)"))
+        prev = "Inquiry"
+        for st_, ago in steps:
+            if st_ == "Inquiry":
+                continue
+            c.execute("INSERT INTO activity (lead_id, ts, message) VALUES (?,?,?)", (lid, _ts(ago), f"Status: {prev} → {st_}"))
+            prev = st_
+        c.execute("UPDATE leads SET created_at=?, updated_at=?, closed_at=?, paid_date=?, paid_amount=?, hours=? WHERE id=?",
+                  (_ts(first), _ts(last), _ts(last) if closed else None,
+                   (date.today() - timedelta(days=paid[0])).isoformat() if paid else None,
+                   paid[1] if paid else None, hours, lid))
+
+
+def seed_showcase():
+    """Adds one fully worked fictional file (comps, adjustments, facts, narratives) and history so every page has data."""
+    with db() as c:
+        if c.execute("SELECT 1 FROM leads WHERE client_name=?", (SHOWCASE_NAME,)).fetchone():
+            return False
+    today = date.today()
+    fees = get_fees()
+    ids = list(get_setting("demo_lead_ids", []) or [])
+    iso = lambda n: (today - timedelta(days=n)).isoformat()
+    svc = "Date of Death / Probate"
+    eff_ago = 150
+
+    lid = create_lead({
+        "client_name": SHOWCASE_NAME, "phone": "817-555-0161", "email": "reyes.demo@example.com",
+        "street": "4108 Cedar Ridge Ct", "city": "Fort Worth", "zip": "76109", "county": "Tarrant",
+        "assignment_type": svc, "status": "In Progress", "fee": fees.get(svc, 600), "deadline": (today + timedelta(days=4)).isoformat(),
+        "source": "Referral", "notes": "Fictional demo file: retrospective value for estate inventory. Access via the executor.",
+    })
+    ids.append(lid)
+
+    def comp(addr, mls, price, c_off, s_off, dom, prox, dr, gla, cond, qual, weight, why, t, cq, g, site, oth=0, fin="Conventional"):
+        eff = today - timedelta(days=eff_ago)
+        return {"Address": addr, "MLS #": mls, "Status": "Settled Sale", "Sale Price": price,
+                "Contract Date": (eff - timedelta(days=c_off)).isoformat(), "Sale Date": (eff - timedelta(days=s_off)).isoformat(),
+                "DOM": dom, "Proximity (mi)": prox, "Direction": dr, "GLA": gla, "Concessions ($)": 0, "Financing": fin,
+                "Cond": cond, "Qual": qual, "Weight": weight, "Weight Rationale": why, "Time Adj": t, "Cond/Qual Adj": cq,
+                "GLA Adj": g, "Site Adj": site, "Other Adj": oth}
+
+    comps = [
+        comp("4120 Cedar Ridge Ct", "20871001", 438000, 55, 20, 21, 0.05, "N", 2180, "C3", "Q3", "Most Weight",
+             "Same street; closest match in age, size and condition.", 4400, 0, 1700, 0),
+        comp("4033 Ridgeway Dr", "20866417", 449500, 70, 35, 18, 0.4, "E", 2290, "C3", "Q4", "Most Weight",
+             "Same subdivision; slightly larger with better finishes.", 3600, 0, -3800, -2000),
+        comp("3921 Cedar Hollow Ln", "20859230", 421000, 85, 48, 33, 0.7, "SW", 2105, "C4", "Q3", "Less Weight",
+             "Inferior condition required larger adjustments.", 5900, 8000, 4400, 0),
+        comp("4207 Oakmont Trl", "20851184", 455000, 98, 62, 27, 0.9, "NE", 2350, "C2", "Q3", "Less Weight",
+             "Superior condition and size; adjustments are larger.", 6100, -9000, -6800, -3000),
+        comp("5012 Brookside Cir", "20844720", 468000, 110, 75, 40, 1.6, "NW", 2480, "C2", "Q4", "No Weight",
+             "Larger and superior in condition and quality; set aside.", 7000, -5000, -13000, -4000, -6000),
+    ]
+    unused = [
+        {"Address": "2807 Larkspur Ln", "Status": "Settled Sale", "Reason Not Used": "Size differs significantly",
+         "Comment": "Roughly 900 SF smaller than the subject; no closer sales were needed."},
+        {"Address": "4455 Highgate Ave", "Status": "Settled Sale", "Reason Not Used": "Atypical / non-arm's-length sale",
+         "Comment": "Sold between related parties per MLS remarks."},
+    ]
+    facts = {
+        "Property type": ("Single-family detached", "County records"), "Year built": ("1998", "County records"),
+        "Stories": ("2", "Appraiser-observed"), "Bedrooms": ("4", "MLS"), "Bathrooms": ("2.5", "Appraiser-observed"),
+        "Garage": ("2-car attached", "Appraiser-observed"), "Basement": ("None", "Appraiser-observed"),
+        "Pool": ("No", "Appraiser-observed"), "Foundation / construction": ("Slab; brick and fiber-cement exterior", "Appraiser-observed"),
+        "Parcel / account #": ("00000000 (demo)", "County records"), "Legal description": ("", ""),
+        "Notable features": ("Updated kitchen (2021); covered patio", "Client-provided"),
+    }
+    ctx_demo = {"CITY": "Fort Worth", "COUNTY": "Tarrant", "EFFECTIVE_DATE": _long_date(today - timedelta(days=eff_ago)),
+                "INSPECTION_DATE": _long_date(today - timedelta(days=3)), "CLIENT": SHOWCASE_NAME, "SERVICE": svc,
+                "INTENDED_USE": INTENDED_USE[svc], "INSPECTION_TYPE": "full (interior & exterior)", "REPORT_DATE": _long_date(today),
+                "RECORDS_SOURCE": "Tarrant Appraisal District (TAD) Public Records", "GLA": "2,214 square feet", "COUNTY_GLA": "2,150 square feet",
+                "YEAR_BUILT": "1998", "STORIES": "2", "PROPERTY_TYPE": "Single-family detached", "BEDROOMS": "4", "BATHROOMS": "2.5",
+                "GARAGE": "2-car attached", "CONSTRUCTION": "Slab; brick and fiber-cement exterior",
+                "NOTABLE_FEATURES": "updated kitchen (2021); covered patio", "CONDITION_RATING": "C3", "QUALITY_RATING": "Q3"}
+    seeds = {(s, t): b for s, t, b in NARRATIVE_SEEDS}
+    report = {}
+    for sec, title in [("Scope of work", "Sample — Scope of work"), ("Improvements description", "Sample — Single-family detached"),
+                       ("Neighborhood description", "Sample — Established neighborhood"),
+                       ("Extraordinary assumptions & hypothetical conditions", "Sample — None")]:
+        report[sec] = fill_placeholders(seeds[(sec, title)], ctx_demo)[0]
+    report["Neighborhood description"] = report["Neighborhood description"].replace("[NEIGHBORHOOD]", "Ridgeway Estates")
+    report["_docs"] = ["Engagement letter", "MLS / comparable data"]
+
+    update_lead(
+        lid, effective_date=iso(eff_ago), inspection_type="Full (interior & exterior)", inspection_date=iso(3),
+        tad_gla=2150, ansi_gla=2214, lot_size="0.21 acres", assessed_value="$402,000", tax_year=today.year,
+        records_source="Tarrant Appraisal District (TAD) Public Records", condition_rating="C3", quality_rating="Q3",
+        time_basis="Contract date (UAD 3.6)", no_interest=1, no_prior_services=1,
+        market_log="Comps 1–5 confirmed via MLS on the inspection date.", comps_json=json.dumps(comps_to_records(pd.DataFrame(comps))),
+        unused_json=json.dumps(unused), facts_json=json.dumps({k: {"v": v, "src": s} for k, (v, s) in facts.items()}),
+        report_json=json.dumps(report), opinion_value=443000,
+        reconciliation_notes="Most weight on the two comparables on or near the subject street, which required the smallest "
+                             "and best-supported adjustments. Comparables 3 and 4 bracket the range and were given less weight.",
+    )
+    _set_history(lid, [("Fee Quoted", 11), ("Engaged", 9), ("In Progress", 8)], hours=6.5)
+
+    # ---- six months of history: (name, service, street, city, zip, status, created, steps, paid, source, hours)
+    hist = [
+        ("Alvarez Trust", "Trust Funding & Administration", "112 Mockingbird Ln", "Fort Worth", "76107", "Closed", 178,
+         [("Fee Quoted", 177), ("Engaged", 174), ("Delivered", 168), ("Closed", 150)], (150, "fee"), "Referral", 7.0),
+        ("Brooks Family", "Property Tax Protest (ARB)", "905 Pecan Hollow Dr", "Arlington", "76012", "Closed", 150,
+         [("Fee Quoted", 149), ("Engaged", 146), ("Delivered", 140), ("Closed", 120)], (128, "fee"), "Website form", 4.5),
+        ("Chen Estate", "Date of Death / Probate", "3320 Willow Bend Ct", "Southlake", "76092", "Closed", 128,
+         [("Fee Quoted", 127), ("Engaged", 124), ("Delivered", 115), ("Closed", 100)], (106, "fee"), "Referral", 8.0),
+        ("Dawson Holdings", "Pre-Listing Appraisal", "77 County Road 1200", "Weatherford", "76088", "Closed", 108,
+         [("Fee Quoted", 107), ("Engaged", 104), ("Delivered", 95), ("Closed", 85)], (88, "fee"), "Phone", 5.0),
+        ("Ellison & Park", "Divorce or Marital Property Division", "1801 Meadowcrest Dr", "Keller", "76248", "Closed", 84,
+         [("Fee Quoted", 83), ("Engaged", 80), ("Delivered", 70), ("Closed", 55)], (60, "fee"), "Referral", 7.5),
+        ("Foster Remodel", "PMI / MIP Cancellation", "42 Briar Gate", "Cleburne", "76033", "Delivered", 66,
+         [("Fee Quoted", 65), ("Engaged", 62), ("Delivered", 50)], None, "Text / SMS", 3.5),
+        ("Garza Family", "Property Tax Protest (ARB)", "615 Lakeview Trl", "Granbury", "76048", "Closed", 52,
+         [("Fee Quoted", 51), ("Engaged", 48), ("Delivered", 34), ("Closed", 28)], (30, "fee"), "Repeat client", 4.0),
+        ("Hughes Estate", "Bankruptcy Schedule A/B", "2209 Elm Valley Dr", "Denton", "76208", "Delivered", 38,
+         [("Fee Quoted", 37), ("Engaged", 34), ("Delivered", 20)], None, "Referral", 6.0),
+        ("Iverson Partners", "Expert Witness & Litigation Support", "950 Commerce Park Blvd", "Grand Prairie", "75050", "Delivered", 26,
+         [("Fee Quoted", 25), ("Engaged", 22), ("Delivered", 9)], None, "Referral", 12.0),
+        ("Jensen Family", "Pre-Purchase for Buyers", "18 Sunrise Cir", "Mansfield", "76063", "Lost", 40,
+         [("Fee Quoted", 39), ("Lost", 33)], None, "Website form", None),
+        ("Kline Trust", "Gift Tax (Form 709)", "7 Stonegate Way", "Burleson", "76028", "Lost", 21,
+         [("Fee Quoted", 20), ("Lost", 14)], None, "Phone", None),
+    ]
+    surnames = ["Morales", "Whitaker", "Okafor", "Lindqvist", "Delgado", "Prescott", "Nakamura", "Bellamy", "Castillo",
+                "Hargrove", "Sullivan", "Tran", "Montgomery", "Reeves", "Abbott", "Navarro"]
+    svc_cycle = ["Property Tax Protest (ARB)", "Date of Death / Probate", "Pre-Listing Appraisal",
+                 "Divorce or Marital Property Division", "PMI / MIP Cancellation", "Trust Funding & Administration",
+                 "Pre-Purchase for Buyers", "Expert Witness & Litigation Support"]
+    city_cycle = [("Fort Worth", "76116"), ("Arlington", "76017"), ("Keller", "76244"), ("Southlake", "76092"),
+                  ("Weatherford", "76086"), ("Burleson", "76028"), ("Mansfield", "76063"), ("Fort Worth", "76133"),
+                  ("Granbury", "76049"), ("Cleburne", "76031"), ("Denton", "76205"), ("Grand Prairie", "75052")]
+    src_cycle = ["Referral", "Phone", "Website form", "Repeat client", "Text / SMS", "Email"]
+    roads = ["Oak Hollow Dr", "Maple Run", "Cedar Bend Ln", "Prairie View Ct", "Stonegate Blvd", "Willow Creek Rd"]
+    for i, nm in enumerate(surnames):
+        created = 176 - 10 * i
+        deliv = created - 9
+        steps = [("Fee Quoted", created - 1), ("Engaged", created - 3), ("Delivered", deliv)]
+        last = i == len(surnames) - 1                       # the newest one is still unpaid
+        if not last:
+            steps.append(("Closed", deliv - 12 if deliv - 12 >= 0 else 0))
+        city, zp = city_cycle[i % len(city_cycle)]
+        hist.append((f"{nm} Family", svc_cycle[i % len(svc_cycle)], f"{100 + i * 37} {roads[i % len(roads)]}", city, zp,
+                     "Delivered" if last else "Closed", created, steps,
+                     None if last else (max(deliv - 10, 0), "fee"), src_cycle[i % len(src_cycle)], 3.5 + (i * 5) % 8))
+    for name, sv, street, city, zp, status, created, steps, paid, src, hrs in hist:
+        fee = fees.get(sv, 500)
+        hid = create_lead({
+            "client_name": f"{name} (demo)", "phone": "817-555-0100", "street": street, "city": city, "zip": zp,
+            "county": CITY_COUNTY.get(city.lower(), ""), "assignment_type": sv, "status": status, "fee": fee,
+            "source": src, "deadline": iso(steps[-1][1] - 2), "no_interest": 1, "no_prior_services": 1,
+        })
+        ids.append(hid)
+        _set_history(hid, [("Inquiry", created)] + steps, paid=((paid[0], fee) if paid else None), hours=hrs,
+                     closed=status in TERMINAL)
+        if hrs and status in EARNED:                     # a little driving for each delivered file
+            miles = round(14 + (hid * 7) % 22, 1)
+            d0 = today - timedelta(days=steps[-2][1] if len(steps) > 1 else 5)
+            add_trip(d0, miles, default_mileage_rate(d0), "Office (demo)", f"{street}, {city}", "Property inspection", hid)
+
+    # ---- overhead + a few file-linked costs (marked "(demo)" so they can be removed)
+    for m in range(6):
+        d0 = add_months(today.replace(day=1), -m)
+        add_expense(d0, "MLS & data subscriptions", "MLS", "Monthly MLS access (demo)", 135.0, None, True)
+        add_expense(d0, "Software & technology", "Software", "Appraisal software (demo)", 69.0, None, True)
+    add_expense(today - timedelta(days=140), "E&O / liability insurance", "Carrier", "Annual E&O premium (demo)", 1850.0, None, True)
+    add_expense(today - timedelta(days=95), "Licenses, dues & continuing education", "Provider", "CE course (demo)", 295.0, None, True)
+    add_expense(today - timedelta(days=60), "Marketing & advertising", "Print shop", "Business cards (demo)", 84.5, None, False)
+    add_expense(today - timedelta(days=8), "Vehicle (non-mileage)", "Parking", "Courthouse parking (demo)", 18.0, ids[-3], False)
+    add_trip(today - timedelta(days=3), 18.4, default_mileage_rate(today), "Office (demo)", "4108 Cedar Ridge Ct, Fort Worth", "Property inspection", lid)
+    add_trip(today - timedelta(days=2), 9.2, default_mileage_rate(today), "Office (demo)", "Comparable drive-by, Cedar Ridge area", "Comparable drive-by", lid)
+
+    set_setting("demo_lead_ids", ids)
+    return True
+
+
+def seed_full_demo():
+    """Sample pipeline + the full showcase. Only the leads added here are tracked as demo data, so real files are never touched."""
+    with db() as c:
+        before = {r["id"] for r in c.execute("SELECT id FROM leads")}
+    seed_demo()
+    with db() as c:
+        after = {r["id"] for r in c.execute("SELECT id FROM leads")}
+    set_setting("demo_lead_ids", sorted(set(get_setting("demo_lead_ids", []) or []) | (after - before)))
+    seed_showcase()
+
+
+def delete_demo():
+    """Remove everything loaded by the full demo (leads, their activity, and costs marked (demo))."""
+    ids = list(get_setting("demo_lead_ids", []) or [])
+    with db() as c:
+        for i in ids:
+            c.execute("DELETE FROM activity WHERE lead_id=?", (i,))
+            c.execute("DELETE FROM leads WHERE id=?", (i,))
+        c.execute("DELETE FROM expenses WHERE description LIKE '%(demo)'")
+        c.execute("DELETE FROM mileage WHERE origin LIKE '%(demo)'")
+    set_setting("demo_lead_ids", [])
+    return len(ids)
+
+
 # ==== UI ====
 # ======================================================================
 PAGE_DASH = "🏠 Dashboard"
@@ -1801,7 +2575,7 @@ PAGE_PIPELINE = "📊 Pipeline"
 PAGE_NEW = "➕ New Lead"
 PAGE_WORKFILE = "📋 Working Files"
 PAGE_REPORTS = "📈 Run Reports"
-PAGE_FEES = "💵 Fee Schedule"
+PAGE_FEES = "⚙️ Settings & Libraries"
 PAGE_BOOKS = "🧾 Expenses & Mileage"
 PAGES = [PAGE_DASH, PAGE_NEW, PAGE_PIPELINE, PAGE_WORKFILE, PAGE_REPORTS, PAGE_BOOKS, PAGE_FEES]
 
@@ -1894,11 +2668,23 @@ def page_dashboard():
     h1, h2 = st.columns([4, 1], vertical_alignment="center")
     h1.title("🏠 Dashboard")
     h1.caption(f"{APPRAISER['firm']} · {today:%A, %B %d, %Y} · Welcome back, {APPRAISER['name'].split()[0]}.")
-    if h2.button("➕ New lead", type="primary", use_container_width=True, key="dash_new"):
+    if h2.button("➕ New lead", type="primary", width="stretch", key="dash_new"):
         goto(PAGE_NEW)
+    with st.expander("🧭 5-minute tour"):
+        st.markdown(
+            "1. **➕ New Lead** — paste a text or email and it pulls out the name, phone, address, service and deadline.\n"
+            "2. **📊 Pipeline** — every lead lives here; open a file to move it forward.\n"
+            "3. **📋 Working Files** → open *DEMO — Reyes Residence*: Subject & Scope, Comps & Adjustments (import an MLS CSV), "
+            "then **📄 Report Materials** → *Prepare report materials (Word draft)*.\n"
+            "4. **📈 Run Reports** → profit & loss, receivables, compliance.\n"
+            "5. **⚙️ Settings & Libraries** → the narrative library: replace the sample language with your own.\n\n"
+            "Notice anything slow or missing? Jot it down — that's what gets built next.")
     df = list_leads()
     if df.empty:
-        st.info("No files yet — add your first lead, or load sample leads from the sidebar to see the dashboard filled in.")
+        st.info("No files yet — add your first lead, or load the full demo to see everything filled in.")
+        if st.button("✨ Load full demo", type="primary", key="dash_demo"):
+            seed_full_demo()
+            st.rerun()
         return
 
     rf = report_frame(df)
@@ -2414,8 +3200,8 @@ def page_workfile():
     st.progress(done / len(scored) if scored else 0.0,
                 text=f"UAD 3.6 data readiness: {done} of {len(scored)} checks complete (details on the last tab)")
 
-    t_over, t_subj, t_comps, t_ready = st.tabs(
-        ["📌 Overview", "🏠 Subject & Scope", "📁 Comps & Adjustments", "✅ Readiness & Export"])
+    t_over, t_subj, t_comps, t_rm, t_ready = st.tabs(
+        ["📌 Overview", "🏠 Subject & Scope", "📁 Comps & Adjustments", "📄 Report Materials", "✅ Readiness & Export"])
     fees = get_fees()
 
     # ---- Overview ----
@@ -2632,6 +3418,9 @@ def page_workfile():
         st.caption("Grid edits are only stored when you press Save (the helpers and CSV import save the grid for you).")
 
     # ---- Readiness & export ----
+    with t_rm:
+        render_report_materials(lid, get_lead(lid))
+
     with t_ready:
         fresh = get_lead(lid)
         items = uad_readiness(fresh)
@@ -3065,8 +3854,134 @@ def page_books():
 # ----------------------------------------------------------------------
 # FEE SCHEDULE PAGE
 # ----------------------------------------------------------------------
-def page_fees():
-    st.title("💵 Fee Schedule")
+# ----------------------------------------------------------------------
+# REPORT MATERIALS (per-file tab) + SETTINGS / LIBRARIES PAGE
+# ----------------------------------------------------------------------
+def _save_report(lid, updates):
+    rep = load_report(get_lead(lid))
+    rep.update(updates)
+    update_lead(lid, report_json=json.dumps(rep))
+
+
+def _rm_insert(key, pick_key, ctx):
+    nid = st.session_state.get(pick_key)
+    row = next((n for n in list_narratives() if n["id"] == nid), None)
+    if row:
+        st.session_state[key] = fill_placeholders(row["body"], ctx)[0]
+
+
+def _rm_refill(key, ctx):
+    st.session_state[key] = fill_placeholders(st.session_state.get(key, ""), ctx)[0]
+
+
+def render_report_materials(lid, lead):
+    today = date.today()
+    facts = load_facts(lead)
+    saved = load_report(lead)
+    calc = compute_comps(load_comps(lead))
+    unused = normalize_unused(load_unused(lead))
+    ctx = report_context(lead, facts, calc, today)
+    cur = {s: st.session_state.get(f"rm_{lid}_{i}", saved.get(s, "")) for i, s in enumerate(REPORT_SECTIONS)}
+    cur["_docs"] = st.session_state.get(f"rm_docs_{lid}", saved.get("_docs", []))
+    checks, passed = report_checks(lead, calc, facts, cur, today)
+    n_written = sum(1 for s in REPORT_SECTIONS if (cur.get(s) or "").strip())
+    cnt = {k: sum(1 for c in checks if c["sev"] == k) for k in SEV_ORDER}
+
+    st.caption("Everything you enter here is reused in the Word draft — nothing is written by AI, and no value is ever "
+               "suggested. Comps and adjustments come from the saved Comps & Adjustments tab.")
+    m = st.columns(5)
+    m[0].metric("Narratives", f"{n_written} / {len(REPORT_SECTIONS)}")
+    m[1].metric("🔴 Needs fixing", cnt["fix"])
+    m[2].metric("🟡 Missing", cnt["missing"])
+    m[3].metric("🔵 To review", cnt["review"])
+    m[4].metric("✅ Checks passed", passed)
+    try:
+        docx_bytes = build_report_docx(lead, calc, unused, facts, cur, checks, today)
+        st.download_button("📄 Prepare report materials (Word draft)", docx_bytes, type="primary", key=f"rm_dl_{lid}",
+                           file_name=f"report_materials_{slug((lead['client_name'] or 'file').lower())}_{today.isoformat()}.docx",
+                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        st.caption("Yellow highlights in the Word file mark text you still need to complete or confirm. Unsaved edits below are included.")
+    except ImportError:
+        st.error("The Word export needs the python-docx package (add `python-docx` to requirements.txt).")
+
+    t_nar, t_facts, t_chk, t_docs = st.tabs(["📝 Narratives", "🏠 Property data sheet", "✅ Completeness check", "🗂️ Workfile documents"])
+
+    with t_nar:
+        lib = list_narratives()
+        st.caption("Pick language from your library for each section, adjust it, and save. Known details (client, dates, "
+                   "address, GLA, comps…) fill in automatically; anything in [BRACKETS] is yours to complete.")
+        for i, sec in enumerate(REPORT_SECTIONS):
+            key = f"rm_{lid}_{i}"
+            if key not in st.session_state:
+                st.session_state[key] = saved.get(sec, "")
+            done = bool((st.session_state[key] or "").strip())
+            with st.expander(("✅ " if done else "⬜ ") + sec, expanded=False):
+                opts = [n for n in lib if n["section"] == sec]
+                by_id = {n["id"]: n["title"] for n in opts}
+                c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+                pk = f"pick_{lid}_{i}"
+                pick = c1.selectbox("Insert from library", [n["id"] for n in opts], index=None,
+                                    format_func=lambda x, b=by_id: b[x], placeholder="Choose saved language…", key=pk)
+                c2.button("Use this language", key=f"use_{lid}_{i}", disabled=pick is None, on_click=_rm_insert,
+                          args=(key, pk, ctx), width="stretch")
+                st.text_area(sec, key=key, height=170, label_visibility="collapsed")
+                text = st.session_state[key] or ""
+                filled, left = fill_placeholders(text, ctx)
+                if filled != text:
+                    st.button("Fill known details", key=f"refill_{lid}_{i}", on_click=_rm_refill, args=(key, ctx))
+                if left:
+                    st.caption("To complete: " + ", ".join(f"`[{t}]`" for t in left))
+                if text.strip():
+                    with st.popover("➕ Save to my library"):
+                        st.caption("Replace client-specific details with [PLACEHOLDERS] first so it can be reused.")
+                        ttl = st.text_input("Title", key=f"ttl_{lid}_{i}")
+                        if st.button("Save to library", key=f"sv_{lid}_{i}"):
+                            add_narrative(sec, ttl or f"{sec} — saved from file #{lid}", text)
+                            flash("success", "Added to your narrative library.")
+                            st.rerun()
+        if st.button("💾 Save narratives", type="primary", key=f"save_nar_{lid}"):
+            _save_report(lid, {s: st.session_state.get(f"rm_{lid}_{i}", "") for i, s in enumerate(REPORT_SECTIONS)})
+            log_activity(lid, "Report narratives saved")
+            flash("success", "Narratives saved.")
+            st.rerun()
+
+    with t_facts:
+        st.caption("Enter each fact once and tag where it came from. MLS and client-provided facts are flagged as unverified "
+                   "until you confirm them — so an unchecked MLS field never quietly becomes a reported fact.")
+        edited = st.data_editor(
+            facts_frame(lead), hide_index=True, key=f"facts_{lid}", disabled=["Field"], width="stretch",
+            column_config={"Source": st.column_config.SelectboxColumn("Source", options=FACT_SOURCES[1:], help="Where did this come from?")})
+        nv = sum(1 for r in edited.to_dict("records") if not _isblank(r["Value"]) and r["Source"] in VERIFIED_SOURCES)
+        nu = sum(1 for r in edited.to_dict("records") if not _isblank(r["Value"]) and r["Source"] not in VERIFIED_SOURCES)
+        st.caption(f"{nv} verified · {nu} unverified or unlabeled")
+        if st.button("💾 Save property data sheet", key=f"save_facts_{lid}", type="primary"):
+            update_lead(lid, facts_json=facts_to_json(edited), log="Property data sheet updated")
+            flash("success", "Property data sheet saved.")
+            st.rerun()
+
+    with t_chk:
+        if not checks:
+            st.success("No open items — the completeness check found nothing to resolve.")
+        for sev in ("fix", "missing", "review"):
+            items = [c for c in checks if c["sev"] == sev]
+            if items:
+                st.markdown(f"**{SEV_LABEL[sev]}** ({len(items)})")
+                for c in items:
+                    st.markdown(f"- **{c['area']}** — {c['msg']}")
+        st.caption("🔴 is a mathematical or factual conflict, 🟡 is information or documentation not yet entered, and 🔵 is "
+                   "something only your professional judgment can settle. This is a prompt, not a substitute for your own review.")
+
+    with t_docs:
+        st.caption("Tick what is already in the workfile folder. Missing items appear in the completeness check and the Word draft.")
+        sel = st.multiselect("On file", DOC_ITEMS, default=[d for d in saved.get("_docs", []) if d in DOC_ITEMS], key=f"rm_docs_{lid}")
+        if st.button("💾 Save", key=f"save_docs_{lid}"):
+            _save_report(lid, {"_docs": sel})
+            flash("success", "Workfile documents saved.")
+            st.rerun()
+        st.caption("USPAP's Record Keeping Rule governs what the workfile must contain — confirm against the current edition.")
+
+
+def _fees_tab():
     st.markdown("Baseline fees applied to new leads. Add, rename or remove services in the grid. "
                 "Changing a fee here does not change quotes already on existing files.")
     fees = get_fees()
@@ -3085,6 +4000,65 @@ def page_fees():
             save_fees({n: int(f) for n, f in zip(names, clean["Fee ($)"].fillna(0))})
             flash("success", "Fee schedule saved.")
             st.rerun()
+
+
+def _library_tab():
+    st.markdown("Your own approved language, organized by report section. Starter paragraphs are marked **Sample** — edit them into "
+                "your voice or replace them. Nothing here is AI-generated.")
+    with st.expander("Placeholders that fill in automatically"):
+        st.markdown(", ".join(f"`[{k}]`" for k in sorted(TOKEN_HELP)))
+        st.caption("Any other [CAPITALIZED_TOKEN] you write simply stays highlighted for you to complete. "
+                   "Example: `[MARKET_TREND]`, `[NEIGHBORHOOD]`.")
+    sec = st.selectbox("Section", ["All sections"] + REPORT_SECTIONS, key="lib_sec")
+    rows = list_narratives(None if sec == "All sections" else sec)
+    st.caption(f"{len(rows)} saved passage(s)")
+    with st.expander("➕ Add new language"):
+        with st.form("lib_add", clear_on_submit=True):
+            ns = st.selectbox("Section", REPORT_SECTIONS, key="lib_new_sec")
+            nt = st.text_input("Title")
+            nb = st.text_area("Language", height=140, help="Use [PLACEHOLDERS] for anything that changes per assignment.")
+            if st.form_submit_button("Add to library", type="primary"):
+                if not nb.strip():
+                    st.error("Enter the language to save.")
+                else:
+                    add_narrative(ns, nt, nb)
+                    flash("success", "Added.")
+                    st.rerun()
+    for r in rows:
+        with st.expander(f"{r['section']} — {r['title']}" if sec == "All sections" else r["title"]):
+            t = st.text_input("Title", value=r["title"], key=f"lt_{r['id']}")
+            b = st.text_area("Language", value=r["body"], height=150, key=f"lb_{r['id']}")
+            c1, c2, _ = st.columns([1, 1, 4])
+            if c1.button("Save", key=f"ls_{r['id']}", type="primary"):
+                update_narrative(r["id"], t, b)
+                flash("success", "Saved.")
+                st.rerun()
+            if c2.button("Delete", key=f"ld_{r['id']}"):
+                delete_narrative(r["id"])
+                flash("success", "Deleted.")
+                st.rerun()
+    st.markdown("---")
+    st.markdown("**Back up or move your library**")
+    d1, d2 = st.columns(2)
+    d1.download_button("⬇️ Export library (.json)", export_narratives_json(), file_name="narrative_library.json",
+                       mime="application/json")
+    up = d2.file_uploader("Import a library file", type="json", key="lib_up", label_visibility="collapsed")
+    if up is not None and st.button("Merge imported library"):
+        try:
+            a, s_ = import_narratives_json(up.getvalue().decode("utf-8"))
+            flash("success", f"Imported {a} passage(s); skipped {s_} duplicate or invalid.")
+            st.rerun()
+        except (ValueError, UnicodeDecodeError):
+            st.error("That file isn't a valid library export.")
+
+
+def page_settings():
+    st.title("⚙️ Settings & Libraries")
+    t_fee, t_lib = st.tabs(["💵 Fee Schedule", "📚 Narrative Library"])
+    with t_fee:
+        _fees_tab()
+    with t_lib:
+        _library_tab()
 
 
 # ----------------------------------------------------------------------
@@ -3136,6 +4110,9 @@ def main():
         if leads.empty:
             with st.expander("Getting started"):
                 st.caption("Database is empty.")
+                if st.button("✨ Load full demo (best for a walkthrough)", type="primary"):
+                    seed_full_demo()
+                    st.rerun()
                 if st.button("Load sample leads"):
                     seed_demo()
                     st.rerun()
@@ -3147,6 +4124,19 @@ def main():
                     sure = st.checkbox("Delete all simulated leads", key="sim_del_chk")
                     if st.button("🧹 Remove simulated leads", disabled=not sure):
                         flash("success", f"Removed {delete_simulated()} simulated lead(s).")
+                        st.rerun()
+        if not leads.empty:
+            if get_setting("demo_lead_ids"):
+                with st.expander("Full demo data"):
+                    sure_d = st.checkbox("Remove all demo files, costs and trips", key="demo_del_chk")
+                    if st.button("🧹 Remove demo data", disabled=not sure_d):
+                        flash("success", f"Removed {delete_demo()} demo file(s) and their costs.")
+                        st.rerun()
+            else:
+                with st.expander("Demo tools"):
+                    st.caption("Adds fictional files, costs and a fully worked example. Fully removable.")
+                    if st.button("✨ Add full demo data"):
+                        seed_full_demo()
                         st.rerun()
         if os.path.exists(DB_PATH):
             with open(DB_PATH, "rb") as fh:
@@ -3171,7 +4161,7 @@ def main():
     elif page == PAGE_BOOKS:
         page_books()
     else:
-        page_fees()
+        page_settings()
 
 
 main()
