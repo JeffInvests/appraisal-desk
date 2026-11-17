@@ -21,7 +21,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "v2.5"
+APP_VERSION = "v2.5.1"
 DB_PATH = os.environ.get("APPRAISAL_DB", "appraisal_desk.db")
 BACKUP_ROOT = "Appraisal_Files_Active"
 
@@ -1945,6 +1945,21 @@ def update_narrative(nid, title, body):
         c.execute("UPDATE narratives SET title=?, body=? WHERE id=?", (title.strip() or "Untitled", body.strip(), nid))
 
 
+def get_narrative(nid):
+    with db() as c:
+        r = c.execute("SELECT id, section, title, body FROM narratives WHERE id=?", (nid,)).fetchone()
+    return dict(r) if r else None
+
+
+def templatize(text, ctx):
+    """Turn filled-in details (client, dates, address, GLA...) back into [PLACEHOLDERS] so saved language stays reusable."""
+    out = text or ""
+    for tok, val in sorted(ctx.items(), key=lambda kv: -len(kv[1])):
+        if len(val) >= 4:
+            out = re.sub(rf"(?<![\w\[]){re.escape(val)}(?![\w\]])", f"[{tok}]", out)
+    return out
+
+
 def delete_narrative(nid):
     with db() as c:
         c.execute("DELETE FROM narratives WHERE id=?", (nid,))
@@ -3863,11 +3878,34 @@ def _save_report(lid, updates):
     update_lead(lid, report_json=json.dumps(rep))
 
 
-def _rm_insert(key, pick_key, ctx):
-    nid = st.session_state.get(pick_key)
-    row = next((n for n in list_narratives() if n["id"] == nid), None)
+NEW_OPT = "__new__"
+
+
+def _rm_pick(key, pk, ctx):
+    """Choosing saved language loads it (details filled in) straight into the editable box."""
+    v = st.session_state.get(pk)
+    row = get_narrative(v) if v not in (None, NEW_OPT) else None
     if row:
         st.session_state[key] = fill_placeholders(row["body"], ctx)[0]
+
+
+def _rm_save_new(sec, key, pk, nk, ck, ctx):
+    name = (st.session_state.get(nk) or "").strip()
+    text = st.session_state.get(key) or ""
+    if not name or not text.strip():
+        return
+    body = templatize(text, ctx) if st.session_state.get(ck, True) else text
+    st.session_state[pk] = add_narrative(sec, name, body)
+    st.session_state[nk] = ""
+    flash("success", f"Saved “{name}” to your library — it's now selected for this section.")
+
+
+def _rm_update(nid, key, ck, ctx):
+    row = get_narrative(nid)
+    text = st.session_state.get(key) or ""
+    if row and text.strip():
+        update_narrative(nid, row["title"], templatize(text, ctx) if st.session_state.get(ck, True) else text)
+        flash("success", f"Updated “{row['title']}” in your library.")
 
 
 def _rm_refill(key, ctx):
@@ -3908,39 +3946,62 @@ def render_report_materials(lid, lead):
 
     with t_nar:
         lib = list_narratives()
-        st.caption("Pick language from your library for each section, adjust it, and save. Known details (client, dates, "
-                   "address, GLA, comps…) fill in automatically; anything in [BRACKETS] is yours to complete.")
+        st.caption("For each section, pick saved language — it loads into the box with your client, dates, address, GLA and comps "
+                   "already filled in — then edit it freely. Anything in [BRACKETS] is yours to complete. "
+                   "Choose **➕ Create new…** to save your own wording under a name you'll remember.")
         for i, sec in enumerate(REPORT_SECTIONS):
-            key = f"rm_{lid}_{i}"
+            key, pk = f"rm_{lid}_{i}", f"pick_{lid}_{i}"
+            nk, ck = f"nm_{lid}_{i}", f"tm_{lid}_{i}"
             if key not in st.session_state:
                 st.session_state[key] = saved.get(sec, "")
-            done = bool((st.session_state[key] or "").strip())
+            opts = [n for n in lib if n["section"] == sec]
+            by_id = {n["id"]: n["title"] for n in opts}
+            if st.session_state.get(pk) not in [None, NEW_OPT, *by_id]:
+                st.session_state[pk] = None                       # that entry was deleted from the library
+            # The title reflects what is SAVED, not what is being typed: a title that changes mid-edit makes Streamlit
+            # rebuild the section collapsed, which looks like the language vanished.
+            done = bool((saved.get(sec) or "").strip())
             with st.expander(("✅ " if done else "⬜ ") + sec, expanded=False):
-                opts = [n for n in lib if n["section"] == sec]
-                by_id = {n["id"]: n["title"] for n in opts}
-                c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
-                pk = f"pick_{lid}_{i}"
-                pick = c1.selectbox("Insert from library", [n["id"] for n in opts], index=None,
-                                    format_func=lambda x, b=by_id: b[x], placeholder="Choose saved language…", key=pk)
-                c2.button("Use this language", key=f"use_{lid}_{i}", disabled=pick is None, on_click=_rm_insert,
-                          args=(key, pk, ctx), width="stretch")
-                st.text_area(sec, key=key, height=170, label_visibility="collapsed")
+                st.selectbox("Language", [NEW_OPT, *by_id], index=None, key=pk, on_change=_rm_pick, args=(key, pk, ctx),
+                             format_func=lambda x, b=by_id: "➕ Create new…" if x == NEW_OPT else b[x],
+                             placeholder="Choose saved language, or create new…")
+                picked = st.session_state.get(pk)
+                st.text_area(sec, key=key, height=190, label_visibility="collapsed",
+                             placeholder="Pick saved language above to load it here, or just type your own. "
+                                         "Details like the client and dates fill in automatically.")
                 text = st.session_state[key] or ""
                 filled, left = fill_placeholders(text, ctx)
                 if filled != text:
                     st.button("Fill known details", key=f"refill_{lid}_{i}", on_click=_rm_refill, args=(key, ctx))
                 if left:
                     st.caption("To complete: " + ", ".join(f"`[{t}]`" for t in left))
-                if text.strip():
-                    with st.popover("➕ Save to my library"):
-                        st.caption("Replace client-specific details with [PLACEHOLDERS] first so it can be reused.")
-                        ttl = st.text_input("Title", key=f"ttl_{lid}_{i}")
-                        if st.button("Save to library", key=f"sv_{lid}_{i}"):
-                            add_narrative(sec, ttl or f"{sec} — saved from file #{lid}", text)
-                            flash("success", "Added to your narrative library.")
-                            st.rerun()
+
+                def save_form(text=text, sec=sec, key=key, pk=pk, nk=nk, ck=ck, i=i):
+                    st.text_input("Name it so you can find it later", key=nk, placeholder="e.g. My standard Fort Worth scope")
+                    st.checkbox("Turn this file's details back into [PLACEHOLDERS] so it can be reused (recommended)",
+                                value=True, key=ck)
+                    shown = templatize(text, ctx) if st.session_state.get(ck, True) else text
+                    st.caption("What will be saved:")
+                    st.code(shown or " ", language=None, wrap_lines=True)
+                    st.button("💾 Save to library", type="primary", key=f"savenew_{lid}_{i}", on_click=_rm_save_new,
+                              args=(sec, key, pk, nk, ck, ctx),
+                              disabled=not ((st.session_state.get(nk) or "").strip() and text.strip()))
+
+                if picked == NEW_OPT:
+                    st.markdown("**Save this wording as new language**")
+                    st.caption("Type or paste your language in the box above (it keeps whatever is there now), then name it.")
+                    save_form()
+                elif text.strip():
+                    c1, c2, c3 = st.columns([1, 1, 1])
+                    if picked:
+                        c1.button("↺ Reset to saved", key=f"reset_{lid}_{i}", on_click=_rm_pick, args=(key, pk, ctx),
+                                  help="Reload the saved language, discarding your edits in this box.")
+                        c2.button("💾 Update saved language", key=f"upd_{lid}_{i}", on_click=_rm_update,
+                                  args=(picked, key, ck, ctx), help="Overwrite the saved entry with the text in the box.")
+                    with c3.popover("➕ Save as new…"):
+                        save_form()
         if st.button("💾 Save narratives", type="primary", key=f"save_nar_{lid}"):
-            _save_report(lid, {s: st.session_state.get(f"rm_{lid}_{i}", "") for i, s in enumerate(REPORT_SECTIONS)})
+            _save_report(lid, {s_: st.session_state.get(f"rm_{lid}_{i}", "") for i, s_ in enumerate(REPORT_SECTIONS)})
             log_activity(lid, "Report narratives saved")
             flash("success", "Narratives saved.")
             st.rerun()
