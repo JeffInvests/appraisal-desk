@@ -21,7 +21,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "v2.5.1"
+APP_VERSION = "v2.6"
 DB_PATH = os.environ.get("APPRAISAL_DB", "appraisal_desk.db")
 BACKUP_ROOT = "Appraisal_Files_Active"
 
@@ -2628,51 +2628,85 @@ def show_flash():
 # PIPELINE PAGE (home)
 # ----------------------------------------------------------------------
 def render_detail(lid):
+    """Lead panel shown beside the pipeline table: move it forward, log notes, edit details, or open the working file."""
     lead = get_lead(lid)
     if not lead:
         return
-    st.markdown("---")
-    st.markdown(f"### {lead['client_name']} · {lead['street']}")
-    c1, c2, c3 = st.columns([1.2, 1, 1.4])
-
-    with c1:
-        digits = re.sub(r"\D", "", lead.get("phone") or "")
-        st.markdown(f"**Phone:** [{lead['phone']}](tel:{digits})" if digits else "**Phone:** —")
-        st.markdown(f"**Email:** [{lead['email']}](mailto:{lead['email']})" if lead.get("email") else "**Email:** —")
+    status = lead["status"]
+    with st.container(border=True):
+        st.markdown(f"#### {lead['client_name']}")
         maps = f"https://www.google.com/maps/search/?api=1&query={quote_plus(full_address(lead))}"
-        st.markdown(f"**Property:** [{full_address(lead)}]({maps})")
-        st.markdown(f"**County:** {lead.get('county') or '—'} · **Source:** {lead.get('source') or '—'}")
-        st.markdown(f"**Service:** {lead['assignment_type']}")
-        st.markdown(f"**Fee:** ${lead.get('fee') or 0:,} · **Due:** {due_label(lead['deadline'], lead['status'])}")
-        if lead.get("notes"):
-            st.caption(lead["notes"])
-
-    with c2:
-        new_status = st.selectbox("Status", STATUSES, index=STATUSES.index(lead["status"]), key=f"qs_{lid}")
-        if st.button("Update status", key=f"qs_btn_{lid}"):
-            ok, msg = change_status(lid, new_status)
+        st.markdown(f"[{full_address(lead)}]({maps})")
+        st.markdown(f"**{status}** · ${lead.get('fee') or 0:,} · {due_label(lead['deadline'], status)}  \n"
+                    f"{lead['assignment_type']}")
+        a1, a2 = st.columns(2)
+        nxt = STATUSES[STATUSES.index(status) + 1] if status in STATUSES[:-3] + ["Delivered"] else None
+        if nxt and a1.button(f"➡️ Move to {nxt}", key=f"adv_{lid}", type="primary", width="stretch"):
+            ok, msg = change_status(lid, nxt)
             flash("success" if ok else "error", msg)
             st.rerun()
-        if st.button("📋 Open working file", key=f"open_{lid}", type="primary"):
+        if a2.button("📋 Open working file", key=f"open_{lid}", width="stretch"):
             goto(PAGE_WORKFILE, lid)
 
-    with c3:
-        with st.form(f"noteform_{lid}", clear_on_submit=True):
-            note = st.text_input("Log a call / note", placeholder="Left voicemail, client wants Friday delivery…")
-            if st.form_submit_button("Add to activity log") and note.strip():
-                log_activity(lid, note.strip())
-                update_lead(lid)
-                flash("success", "Note logged.")
-                st.rerun()
-        for r in get_activity(lid, 8):
-            st.caption(f"{r['ts'][:16]} — {r['message']}")
+        t_stat, t_edit, t_more = st.tabs(["🔄 Status & notes", "✏️ Edit details", "🗑️ More"])
 
-    with st.expander("Danger zone"):
-        confirm = st.checkbox("Permanently delete this file and its activity log", key=f"delchk_{lid}")
-        if st.button("Delete file", key=f"del_{lid}", disabled=not confirm):
-            delete_lead(lid)
-            flash("success", "File deleted.")
-            st.rerun()
+        with t_stat:
+            new_status = st.selectbox("Set status", STATUSES, index=STATUSES.index(status), key=f"qs_{lid}")
+            if st.button("Update status", key=f"qs_btn_{lid}"):
+                ok, msg = change_status(lid, new_status)
+                flash("success" if ok else "error", msg)
+                st.rerun()
+            with st.form(f"noteform_{lid}", clear_on_submit=True):
+                note = st.text_input("Log a call / note", placeholder="Left voicemail, client wants Friday delivery…")
+                if st.form_submit_button("Add to activity log") and note.strip():
+                    log_activity(lid, note.strip())
+                    update_lead(lid)
+                    flash("success", "Note logged.")
+                    st.rerun()
+            for r in get_activity(lid, 8):
+                st.caption(f"{r['ts'][:16]} — {r['message']}")
+
+        with t_edit:
+            digits = re.sub(r"\D", "", lead.get("phone") or "")
+            links = []
+            if digits:
+                links.append(f"[📞 {lead['phone']}](tel:{digits})")
+            if lead.get("email"):
+                links.append(f"[✉️ {lead['email']}](mailto:{lead['email']})")
+            if links:
+                st.markdown(" · ".join(links))
+            services = list(get_fees())
+            if lead["assignment_type"] not in services:
+                services.append(lead["assignment_type"])
+            with st.form(f"editform_{lid}"):
+                e1, e2 = st.columns(2)
+                name = e1.text_input("Client name", value=lead["client_name"] or "")
+                phone = e2.text_input("Phone", value=lead.get("phone") or "")
+                email = st.text_input("Email", value=lead.get("email") or "")
+                service = st.selectbox("Service", services, index=services.index(lead["assignment_type"]))
+                f1, f2 = st.columns(2)
+                fee = f1.number_input("Quoted fee ($)", min_value=0, value=int(lead.get("fee") or 0), step=25)
+                due = f2.date_input("Target delivery", value=parse_iso(lead.get("deadline")) or date.today() + timedelta(days=5),
+                                    format="MM/DD/YYYY")
+                notes = st.text_area("Notes", value=lead.get("notes") or "", height=110,
+                                     placeholder="Referral context, access instructions, known issues…")
+                if st.form_submit_button("💾 Save details", type="primary"):
+                    if not name.strip():
+                        st.error("Client name can't be empty.")
+                    else:
+                        update_lead(lid, client_name=name.strip(), phone=phone.strip(), email=email.strip(),
+                                    assignment_type=service, fee=int(fee), deadline=due.isoformat(), notes=notes.strip(),
+                                    log="Details edited")
+                        flash("success", "Details saved.")
+                        st.rerun()
+            st.caption("Property address, inspection details, comps and report materials are on the working file.")
+
+        with t_more:
+            confirm = st.checkbox("Permanently delete this file and its activity log", key=f"delchk_{lid}")
+            if st.button("Delete file", key=f"del_{lid}", disabled=not confirm):
+                delete_lead(lid)
+                flash("success", "File deleted.")
+                st.rerun()
 
 
 # ----------------------------------------------------------------------
@@ -2875,17 +2909,26 @@ def page_pipeline():
         "Source": shown["source"].values,
         "Updated": shown["updated_at"].str[:16].values,
     })
-    st.caption(f"{len(view)} file(s) · click a row to work it")
-    event = st.dataframe(
-        view, hide_index=True, on_select="rerun", selection_mode="single-row", key="pipeline_table",
-        column_config={"Fee": st.column_config.NumberColumn("Fee", format="$%d"),
-                       "ID": st.column_config.NumberColumn("ID", width="small")},
-    )
+    wide = st.toggle("Show all columns", key="pipe_wide", help="Adds service, county, UAD readiness, source and last update.")
+    cols = list(view.columns) if wide else ["ID", "Due", "Client", "Property", "Status", "Fee"]
+    left, right = st.columns([5, 3], gap="large")
+    with left:
+        st.caption(f"{len(view)} file(s) · click a lead to open it on the right")
+        event = st.dataframe(
+            view[cols], hide_index=True, on_select="rerun", selection_mode="single-row", key="pipeline_table",
+            height=min(560, 36 * (len(view) + 1) + 4),
+            column_config={"Fee": st.column_config.NumberColumn("Fee", format="$%d", width="small"),
+                           "Status": st.column_config.TextColumn("Status", width="small"), "ID": None},
+        )
     rows = event.selection.rows if event and event.selection else []
-    if rows:
-        render_detail(int(view.iloc[rows[0]]["ID"]))
-    else:
-        st.caption("Select a row to see contact info, change status, log a call, or open the workfile.")
+    with right:
+        if rows and rows[0] < len(view):
+            render_detail(int(view.iloc[rows[0]]["ID"]))
+        else:
+            with st.container(border=True):
+                st.markdown("**👈 Click a lead**")
+                st.caption("Then, right here, you can move it to the next stage, change its status, log a call or note, "
+                           "edit the client, fee and delivery date, or open the full working file.")
 
     st.download_button(
         "📊 Export pipeline (.csv)",
