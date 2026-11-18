@@ -21,7 +21,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "v2.6"
+APP_VERSION = "v2.7"
 DB_PATH = os.environ.get("APPRAISAL_DB", "appraisal_desk.db")
 BACKUP_ROOT = "Appraisal_Files_Active"
 
@@ -1784,7 +1784,7 @@ def _vs_last(cur, prev):
 
 def due_label(deadline, status):
     d = parse_iso(deadline)
-    if status in TERMINAL:
+    if status in TERMINAL or status in EARNED:
         return "—"
     if not d:
         return "No date"
@@ -2596,13 +2596,53 @@ PAGES = [PAGE_DASH, PAGE_NEW, PAGE_PIPELINE, PAGE_WORKFILE, PAGE_REPORTS, PAGE_B
 
 CSS = """
 <style>
-.stTabs [data-baseweb="tab-list"] { gap: 8px; }
-.stTabs [data-baseweb="tab"] {
-    height: 46px; white-space: pre-wrap; background-color: #ffffff;
-    border-radius: 6px 6px 0 0; font-weight: 600; border: 1px solid #e0e0e0;
+/* ---- layout rhythm ---- */
+.block-container { padding-top: 2.2rem; padding-bottom: 4rem; max-width: 1280px; }
+h1 { font-size: 2rem !important; font-weight: 700 !important; letter-spacing: -0.01em; padding-bottom: 0.2rem; }
+h2, h3, h4 { letter-spacing: -0.005em; }
+[data-testid="stCaptionContainer"] { color: #5B6675; }
+
+/* ---- metric cards ---- */
+[data-testid="stMetric"] { background: #F2F5F9; border: 1px solid #E3E8EF; border-radius: 10px; padding: 12px 14px; }
+[data-testid="stMetricLabel"] p { font-size: 0.8rem; color: #5B6675; font-weight: 600; text-transform: none; }
+[data-testid="stMetricValue"] { font-size: 1.7rem; font-weight: 700; color: #1B2430; }
+
+/* ---- tabs: quiet underline style, clear active state ---- */
+.stTabs [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid #E3E8EF; }
+.stTabs [data-baseweb="tab"] { height: 44px; padding: 0 16px; background: transparent; border: none;
+    border-radius: 8px 8px 0 0; font-weight: 600; color: #5B6675; white-space: nowrap; }
+.stTabs [data-baseweb="tab"]:hover { background: #F2F5F9; color: #1B2430; }
+.stTabs [aria-selected="true"] { background: transparent !important; color: #1F5FA8 !important; }
+.stTabs [data-baseweb="tab-highlight"] { background-color: #1F5FA8 !important; height: 3px; }
+
+/* ---- buttons ---- */
+div.stButton > button, div.stDownloadButton > button, div.stFormSubmitButton > button { border-radius: 8px; font-weight: 600; transition: all .12s ease; }
+div.stButton > button:hover, div.stDownloadButton > button:hover { transform: translateY(-1px); box-shadow: 0 2px 8px rgba(31,95,168,.18); }
+div.stButton > button[kind="primary"], div.stFormSubmitButton > button[kind="primary"] { font-weight: 700; }
+
+/* ---- cards, tables, expanders ---- */
+[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 12px; }
+[data-testid="stExpander"] { border-radius: 10px; border-color: #E3E8EF; }
+[data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
+
+/* ---- sidebar ---- */
+[data-testid="stSidebar"] { background: #F2F5F9; border-right: 1px solid #E3E8EF; }
+[data-testid="stSidebar"] hr { margin: 0.8rem 0; }
+.brandcard { background: #fff; border: 1px solid #E3E8EF; border-radius: 12px; padding: 12px 14px; margin-bottom: 4px; }
+.brandcard .t { font-weight: 700; font-size: 1.05rem; color: #1B2430; }
+.brandcard .s { font-size: .8rem; color: #5B6675; line-height: 1.5; margin-top: 2px; }
+
+/* ---- phones ---- */
+@media (max-width: 640px) {
+    .block-container { padding: 1.2rem 0.9rem 3rem; }
+    h1 { font-size: 1.55rem !important; }
+    [data-testid="stMetric"] { padding: 8px 10px; }
+    [data-testid="stMetricValue"] { font-size: 1.35rem; }
+    .stTabs [data-baseweb="tab"] { padding: 0 11px; height: 40px; font-size: .88rem; }
+    [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]):not(:has([data-testid="stHorizontalBlock"])) { flex-wrap: wrap !important; gap: .5rem !important; }
+    [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]):not(:has([data-testid="stHorizontalBlock"])) > [data-testid="stColumn"] { min-width: calc(50% - .5rem) !important; flex: 1 1 calc(50% - .5rem) !important; }
+    div.stButton > button { min-height: 44px; }
 }
-.stTabs [aria-selected="true"] { background-color: #1f77b4 !important; color: #ffffff !important; }
-div.stButton > button[kind="primary"] { font-weight: 700; }
 </style>
 """
 
@@ -2840,8 +2880,9 @@ def page_pipeline():
     today = date.today()
     df["_due"] = df["deadline"].apply(parse_iso)
     active = ~df["status"].isin(TERMINAL)
-    overdue = active & df["_due"].apply(lambda d: d is not None and d < today)
-    soon = active & df["_due"].apply(lambda d: d is not None and 0 <= (d - today).days <= 3)
+    working = df["status"].isin(PIPELINE_STATUSES)      # not yet delivered: these have live deadlines
+    overdue = working & df["_due"].apply(lambda d: d is not None and d < today)
+    soon = working & df["_due"].apply(lambda d: d is not None and 0 <= (d - today).days <= 3)
     updated = pd.to_datetime(df["updated_at"], errors="coerce")
     stale = (df["status"] == "Fee Quoted") & (updated < datetime.now() - timedelta(days=3))
     inquiry = df["status"] == "Inquiry"
@@ -2856,10 +2897,10 @@ def page_pipeline():
     m[4].metric("Quotes waiting > 3d", int(stale.sum()))
     m[5].metric("Closed this month", f"${int(df.loc[closed_month, 'fee'].fillna(0).sum()):,}")
 
-    f1, f2, f3, f4 = st.columns([1.6, 2, 1.6, 1.4])
+    f1, f2, f3, f4 = st.columns([2.6, 2, 1.6, 1.4])
     with f1:
         preset = st.radio("View", ["Open files", "Needs attention", "Closed / Lost", "Everything"],
-                          key="pipe_view")
+                          key="pipe_view", horizontal=True)
     with f2:
         query = st.text_input("Search", placeholder="Client, address, phone, notes…", key="pipe_search")
     with f3:
@@ -2910,10 +2951,10 @@ def page_pipeline():
         "Updated": shown["updated_at"].str[:16].values,
     })
     wide = st.toggle("Show all columns", key="pipe_wide", help="Adds service, county, UAD readiness, source and last update.")
-    cols = list(view.columns) if wide else ["ID", "Due", "Client", "Property", "Status", "Fee"]
+    cols = list(view.columns) if wide else ["ID", "Due", "Client", "Property", "Status"]
     left, right = st.columns([5, 3], gap="large")
     with left:
-        st.caption(f"{len(view)} file(s) · click a lead to open it on the right")
+        st.caption(f"{len(view)} file(s) · click a lead to open it")
         event = st.dataframe(
             view[cols], hide_index=True, on_select="rerun", selection_mode="single-row", key="pipeline_table",
             height=min(560, 36 * (len(view) + 1) + 4),
@@ -3237,7 +3278,9 @@ def page_workfile():
     st.title("📋 Working Files")
     df = list_leads()
     if df.empty:
-        st.info("No files yet. Add a lead first.")
+        st.info("No files yet — a working file is created the moment you add a lead.")
+        if st.button("➕ Add your first lead", type="primary", key="wf_empty_add"):
+            goto(PAGE_NEW)
         return
     df = df.sort_values("id", ascending=False)
     ids = df["id"].tolist()
@@ -4200,13 +4243,11 @@ def main():
     st.session_state.setdefault("page", PAGE_DASH)
 
     with st.sidebar:
-        st.header("⚖️ Appraisal Desk")
-        st.caption("Clearfork Appraisals")
-        st.text(f"{APPRAISER['firm']}")
-        st.text(f"{APPRAISER['name']}")
-        st.text(f"Appraiser: TX {APPRAISER['license']}")
-        st.text(f"Broker: TX {APPRAISER['broker_license']}")
-        st.text("Coverage: Tarrant & surrounding")
+        st.markdown(
+            f"<div class='brandcard'><div class='t'>⚖️ Appraisal Desk</div>"
+            f"<div class='s'><b>{APPRAISER['firm']}</b><br>{APPRAISER['name']}<br>"
+            f"Appraiser TX {APPRAISER['license']}<br>Broker TX {APPRAISER['broker_license']}<br>"
+            f"Tarrant &amp; surrounding counties</div></div>", unsafe_allow_html=True)
         st.markdown("---")
         st.radio("Navigate", PAGES, key="page")
         st.markdown("---")
