@@ -21,7 +21,7 @@ from urllib.parse import quote_plus
 import pandas as pd
 import streamlit as st
 
-APP_VERSION = "v2.7"
+APP_VERSION = "v2.8"
 DB_PATH = os.environ.get("APPRAISAL_DB", "appraisal_desk.db")
 BACKUP_ROOT = "Appraisal_Files_Active"
 
@@ -2596,49 +2596,70 @@ PAGES = [PAGE_DASH, PAGE_NEW, PAGE_PIPELINE, PAGE_WORKFILE, PAGE_REPORTS, PAGE_B
 
 CSS = """
 <style>
-/* ---- layout rhythm ---- */
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&display=swap');
+:root { --navy:#1E2B37; --cream:#FBF9F4; --sand:#F1ECE2; --line:#E2DACB; --terra:#A9673F; --terra-d:#8A5230; --tint:#F4E7DC; --muted:#5E6A74; }
+
+/* ---- layout rhythm + serif headings (matches clearforkappraisals.com) ---- */
 .block-container { padding-top: 2.2rem; padding-bottom: 4rem; max-width: 1280px; }
-h1 { font-size: 2rem !important; font-weight: 700 !important; letter-spacing: -0.01em; padding-bottom: 0.2rem; }
-h2, h3, h4 { letter-spacing: -0.005em; }
-[data-testid="stCaptionContainer"] { color: #5B6675; }
+h1, h2, h3 { font-family: 'Cormorant Garamond', Georgia, serif !important; color: var(--navy); }
+h1 { font-size: 2.5rem !important; font-weight: 700 !important; letter-spacing: -0.01em; line-height: 1.15 !important;
+     border-left: 6px solid var(--terra); padding: 0.1rem 0 0.1rem 14px !important; margin-bottom: 1rem !important; }
+h2 { font-size: 1.8rem !important; font-weight: 700 !important; }
+h3 { font-size: 1.45rem !important; font-weight: 700 !important; }
+[data-testid="stCaptionContainer"] { color: var(--muted); }
 
 /* ---- metric cards ---- */
-[data-testid="stMetric"] { background: #F2F5F9; border: 1px solid #E3E8EF; border-radius: 10px; padding: 12px 14px; }
-[data-testid="stMetricLabel"] p { font-size: 0.8rem; color: #5B6675; font-weight: 600; text-transform: none; }
-[data-testid="stMetricValue"] { font-size: 1.7rem; font-weight: 700; color: #1B2430; }
+[data-testid="stMetric"] { background: var(--sand); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+[data-testid="stMetricLabel"] p { font-size: 0.8rem; color: var(--muted); font-weight: 600; }
+[data-testid="stMetricValue"] { font-family: 'Cormorant Garamond', Georgia, serif; font-size: 2rem; font-weight: 700; color: var(--navy); }
 
-/* ---- tabs: quiet underline style, clear active state ---- */
-.stTabs [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid #E3E8EF; }
-.stTabs [data-baseweb="tab"] { height: 44px; padding: 0 16px; background: transparent; border: none;
-    border-radius: 8px 8px 0 0; font-weight: 600; color: #5B6675; white-space: nowrap; }
-.stTabs [data-baseweb="tab"]:hover { background: #F2F5F9; color: #1B2430; }
-.stTabs [aria-selected="true"] { background: transparent !important; color: #1F5FA8 !important; }
-.stTabs [data-baseweb="tab-highlight"] { background-color: #1F5FA8 !important; height: 3px; }
+/* ---- TABS: the active tab is a filled navy pill; sub-tabs get an outlined terracotta pill ---- */
+[role="tablist"] { gap: 8px !important; padding: 4px 0 10px !important; border-bottom: 1px solid var(--line) !important; flex-wrap: wrap; }
+[data-testid="stTab"] { height: auto !important; padding: 9px 16px !important; border-radius: 999px !important;
+    border: 1.5px solid var(--line) !important; background: #fff !important; transition: all .12s ease; cursor: pointer; }
+[data-testid="stTab"] p { color: var(--muted) !important; font-weight: 600 !important; white-space: nowrap; }
+[data-testid="stTab"]:hover { border-color: var(--terra) !important; background: var(--tint) !important; }
+[data-testid="stTab"]:hover p { color: var(--terra-d) !important; }
+[data-testid="stTab"][aria-selected="true"] { background: var(--navy) !important; border-color: var(--navy) !important; box-shadow: 0 2px 8px rgba(30,43,55,.25); }
+[data-testid="stTab"][aria-selected="true"] p { color: #fff !important; font-weight: 700 !important; }
+[role="tabpanel"] [data-testid="stTab"][aria-selected="true"] { background: var(--tint) !important; border: 2px solid var(--terra) !important; box-shadow: none; }
+[role="tabpanel"] [data-testid="stTab"][aria-selected="true"] p { color: var(--terra-d) !important; }
+[role="tablist"] .react-aria-SelectionIndicator, [data-baseweb="tab-highlight"], [data-baseweb="tab-border"] { display: none !important; }
+
+/* ---- SIDEBAR NAV: current page is a solid navy bar with a terracotta edge ---- */
+[data-testid="stSidebar"] { background: var(--sand); border-right: 1px solid var(--line); }
+[data-testid="stSidebar"] hr { margin: 0.8rem 0; border-color: var(--line); }
+[data-testid="stSidebar"] [data-testid="stRadio"], [data-testid="stSidebar"] [data-testid="stElementContainer"]:has([data-testid="stRadioGroup"]), [data-testid="stSidebar"] [data-testid="stRadioGroup"], [data-testid="stSidebar"] [data-testid="stRadioGroup"] > div { width: 100% !important; max-width: 100% !important; }
+[data-testid="stSidebar"] [data-testid="stRadioOption"] { display: flex !important; width: 100% !important; box-sizing: border-box; padding: 9px 12px; margin: 2px 0; border-radius: 8px;
+    border: 1px solid transparent; transition: all .12s ease; cursor: pointer; }
+[data-testid="stSidebar"] [data-testid="stRadioOption"] > div > div:first-child { display: none; }
+[data-testid="stSidebar"] [data-testid="stRadioOption"]:hover { background: var(--tint); }
+[data-testid="stSidebar"] [data-testid="stRadioOption"] p { font-size: 1rem; color: var(--navy); }
+[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"] { background: var(--navy); border-color: var(--navy);
+    box-shadow: inset 5px 0 0 var(--terra); padding-left: 16px; }
+[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"] p { color: #fff; font-weight: 700; }
+.brandcard { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 4px; border-top: 4px solid var(--terra); }
+.brandcard .t { font-family: 'Cormorant Garamond', Georgia, serif; font-weight: 700; font-size: 1.5rem; color: var(--navy); line-height: 1.1; }
+.brandcard .s { font-size: .8rem; color: var(--muted); line-height: 1.55; margin-top: 4px; }
 
 /* ---- buttons ---- */
 div.stButton > button, div.stDownloadButton > button, div.stFormSubmitButton > button { border-radius: 8px; font-weight: 600; transition: all .12s ease; }
-div.stButton > button:hover, div.stDownloadButton > button:hover { transform: translateY(-1px); box-shadow: 0 2px 8px rgba(31,95,168,.18); }
-div.stButton > button[kind="primary"], div.stFormSubmitButton > button[kind="primary"] { font-weight: 700; }
+div.stButton > button:hover, div.stDownloadButton > button:hover { transform: translateY(-1px); box-shadow: 0 2px 8px rgba(169,103,63,.25); }
+div.stButton > button[kind="primary"], div.stFormSubmitButton > button[kind="primary"] { font-weight: 700; letter-spacing: .02em; }
 
 /* ---- cards, tables, expanders ---- */
 [data-testid="stVerticalBlockBorderWrapper"] { border-radius: 12px; }
-[data-testid="stExpander"] { border-radius: 10px; border-color: #E3E8EF; }
+[data-testid="stExpander"] { border-radius: 10px; border-color: var(--line); }
 [data-testid="stDataFrame"] { border-radius: 10px; overflow: hidden; }
-
-/* ---- sidebar ---- */
-[data-testid="stSidebar"] { background: #F2F5F9; border-right: 1px solid #E3E8EF; }
-[data-testid="stSidebar"] hr { margin: 0.8rem 0; }
-.brandcard { background: #fff; border: 1px solid #E3E8EF; border-radius: 12px; padding: 12px 14px; margin-bottom: 4px; }
-.brandcard .t { font-weight: 700; font-size: 1.05rem; color: #1B2430; }
-.brandcard .s { font-size: .8rem; color: #5B6675; line-height: 1.5; margin-top: 2px; }
 
 /* ---- phones ---- */
 @media (max-width: 640px) {
     .block-container { padding: 1.2rem 0.9rem 3rem; }
-    h1 { font-size: 1.55rem !important; }
+    h1 { font-size: 1.9rem !important; border-left-width: 5px; }
     [data-testid="stMetric"] { padding: 8px 10px; }
-    [data-testid="stMetricValue"] { font-size: 1.35rem; }
-    .stTabs [data-baseweb="tab"] { padding: 0 11px; height: 40px; font-size: .88rem; }
+    [data-testid="stMetricValue"] { font-size: 1.55rem; }
+    [data-testid="stTab"] { padding: 8px 12px !important; }
+    [data-testid="stTab"] p { font-size: .88rem; }
     [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]):not(:has([data-testid="stHorizontalBlock"])) { flex-wrap: wrap !important; gap: .5rem !important; }
     [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]):not(:has([data-testid="stHorizontalBlock"])) > [data-testid="stColumn"] { min-width: calc(50% - .5rem) !important; flex: 1 1 calc(50% - .5rem) !important; }
     div.stButton > button { min-height: 44px; }

@@ -1,9 +1,9 @@
-﻿[theme]
+[theme]
 base = "light"
-primaryColor = "#1F5FA8"
-backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F2F5F9"
-textColor = "#1B2430"
+primaryColor = "#A9673F"
+backgroundColor = "#FBF9F4"
+secondaryBackgroundColor = "#F1ECE2"
+textColor = "#1E2B37"
 font = "sans serif"
 baseRadius = "8px"
 
